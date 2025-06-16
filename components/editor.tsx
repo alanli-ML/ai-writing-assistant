@@ -3,15 +3,15 @@
 import type React from "react"
 
 import { useEffect, useState, useRef } from "react"
-import { generateText } from "ai"
-import { openai } from "@ai-sdk/openai"
 import { Loader2, MessageSquare, Sparkles, X } from "lucide-react"
+import { doc, getDoc } from "firebase/firestore"
 
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useToast } from "@/components/ui/use-toast"
 import { cn } from "@/lib/utils"
+import { useAuth, db } from "@/components/auth-provider"
 
 type Suggestion = {
   id: string
@@ -33,16 +33,49 @@ interface EditorProps {
 
 export function Editor({ content, onChange }: EditorProps) {
   const { toast } = useToast()
+  const { user } = useAuth()
   const [value, setValue] = useState(content)
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [analyzing, setAnalyzing] = useState(false)
   const [selectedSuggestion, setSelectedSuggestion] = useState<Suggestion | null>(null)
   const [typingTimeout, setTypingTimeout] = useState<NodeJS.Timeout | null>(null)
+  const [userSettings, setUserSettings] = useState<{
+    preferredTone: string
+    writingGoals: string[]
+  }>({
+    preferredTone: "professional",
+    writingGoals: ["clarity", "grammar"]
+  })
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
     setValue(content)
   }, [content])
+
+  // Fetch user settings when user changes
+  useEffect(() => {
+    async function fetchUserSettings() {
+      if (!user) return
+
+      try {
+        const userDocRef = doc(db, "users", user.uid)
+        const userDoc = await getDoc(userDocRef)
+
+        if (userDoc.exists()) {
+          const data = userDoc.data()
+          setUserSettings({
+            preferredTone: data.preferredTone || "professional",
+            writingGoals: data.writingGoals || ["clarity", "grammar"]
+          })
+        }
+      } catch (error) {
+        console.error("Error fetching user settings:", error)
+        // Keep default settings on error
+      }
+    }
+
+    fetchUserSettings()
+  }, [user])
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newValue = e.target.value
@@ -70,40 +103,29 @@ export function Editor({ content, onChange }: EditorProps) {
 
     setAnalyzing(true)
     try {
-      const { text: result } = await generateText({
-        model: openai("gpt-4o"),
-        system: `You are an AI writing assistant for marketing professionals. 
-        Analyze the provided text and identify issues with grammar, tone, and persuasion.
-        Return a JSON array of suggestions with the following structure:
-        [
-          {
-            "id": "unique-id",
-            "type": "grammar|tone|persuasion",
-            "position": { "start": number, "end": number },
-            "original": "original text",
-            "suggested": "suggested improvement",
-            "explanation": "why this change improves the text",
-            "confidence": number between 0-1
-          }
-        ]
-        Only include high-confidence suggestions (>0.7). Limit to 5 most important suggestions.
-        If there are no issues, return an empty array.`,
-        prompt: text,
+      const response = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text,
+          preferredTone: userSettings.preferredTone,
+          writingGoals: userSettings.writingGoals
+        }),
       })
 
-      try {
-        // Extract JSON from the response
-        const jsonMatch = result.match(/\[[\s\S]*\]/)?.[0]
-        if (jsonMatch) {
-          const parsedSuggestions = JSON.parse(jsonMatch) as Suggestion[]
-          setSuggestions(parsedSuggestions)
-        } else {
-          setSuggestions([])
-        }
-      } catch (error) {
-        console.error("Error parsing suggestions:", error)
-        setSuggestions([])
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
       }
+
+      const data = await response.json()
+      
+      if (data.error) {
+        throw new Error(data.error)
+      }
+
+      setSuggestions(data.suggestions || [])
     } catch (error) {
       console.error("Error analyzing text:", error)
       toast({

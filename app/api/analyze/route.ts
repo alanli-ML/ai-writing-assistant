@@ -1,9 +1,14 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { generateText } from "ai"
-import { openai } from "@ai-sdk/openai"
+import { createOpenAI } from "@ai-sdk/openai"
 
 export async function POST(req: NextRequest) {
   try {
+    // Create OpenAI client at runtime to ensure environment variable is available
+    const openaiClient = createOpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    })
+
     const { text, preferredTone, writingGoals } = await req.json()
 
     if (!text || text.length < 20) {
@@ -11,7 +16,7 @@ export async function POST(req: NextRequest) {
     }
 
     const { text: result } = await generateText({
-      model: openai("gpt-4o"),
+      model: openaiClient("gpt-4o"),
       system: `You are an AI writing assistant for marketing professionals. 
       Analyze the provided text and identify issues with grammar, tone, and persuasion.
       ${preferredTone ? `The user prefers a ${preferredTone} tone.` : ""}
@@ -49,6 +54,7 @@ export async function POST(req: NextRequest) {
     }
   } catch (error) {
     console.error("Error in analyze API:", error)
+    console.error("Environment variable available:", !!process.env.OPENAI_API_KEY)
     return NextResponse.json({ error: "Failed to analyze text" }, { status: 500 })
   }
 }
