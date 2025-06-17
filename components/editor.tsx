@@ -51,8 +51,7 @@ export function Editor({ content, onChange }: EditorProps) {
     preferredTone: "professional",
     writingGoals: ["clarity", "grammar"]
   })
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
-  const highlightRef = useRef<HTMLDivElement>(null)
+  const editorRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     setValue(content)
@@ -84,47 +83,72 @@ export function Editor({ content, onChange }: EditorProps) {
     fetchUserSettings()
   }, [user])
 
-  // Sync highlight overlay with textarea scroll and resize
+  // Handle cursor position tracking for contentEditable
   useEffect(() => {
-    const textarea = textareaRef.current
-    const highlight = highlightRef.current
-    
-    if (!textarea || !highlight) return
+    const editor = editorRef.current
+    if (!editor) return
 
-    const syncOverlay = () => {
-      // Copy all relevant styles from textarea to highlight overlay
-      const computedStyle = window.getComputedStyle(textarea)
-      highlight.style.fontSize = computedStyle.fontSize
-      highlight.style.fontFamily = computedStyle.fontFamily
-      highlight.style.lineHeight = computedStyle.lineHeight
-      highlight.style.letterSpacing = computedStyle.letterSpacing
-      highlight.style.wordSpacing = computedStyle.wordSpacing
-      highlight.style.textIndent = computedStyle.textIndent
-      highlight.style.padding = computedStyle.padding
-      highlight.style.border = computedStyle.border
-      highlight.style.borderWidth = computedStyle.borderWidth
-      highlight.style.margin = computedStyle.margin
-      
-      // Sync scroll position
-      highlight.scrollTop = textarea.scrollTop
-      highlight.scrollLeft = textarea.scrollLeft
+    const handleSelectionChange = () => {
+      const selection = window.getSelection()
+      if (selection && selection.rangeCount > 0) {
+        const range = selection.getRangeAt(0)
+        const textContent = editor.textContent || ''
+        
+        // Calculate cursor position in text
+        const preCaretRange = range.cloneRange()
+        preCaretRange.selectNodeContents(editor)
+        preCaretRange.setEnd(range.endContainer, range.endOffset)
+        const cursorPos = preCaretRange.toString().length
+        
+        setCursorPosition(cursorPos)
+      }
     }
 
-    // Initial sync
-    syncOverlay()
-
-    // Sync on scroll
-    textarea.addEventListener('scroll', syncOverlay)
+    document.addEventListener('selectionchange', handleSelectionChange)
     
-    // Sync on resize
-    const resizeObserver = new ResizeObserver(syncOverlay)
-    resizeObserver.observe(textarea)
-
     return () => {
-      textarea.removeEventListener('scroll', syncOverlay)
-      resizeObserver.disconnect()
+      document.removeEventListener('selectionchange', handleSelectionChange)
     }
   }, [])
+
+  // Sync contentEditable with value state and preserve cursor position
+  useEffect(() => {
+    const editor = editorRef.current
+    if (!editor) return
+
+    const currentTextContent = editor.textContent || ''
+    
+    // Only update if content actually differs to avoid cursor jumping
+    if (currentTextContent !== value) {
+      // Save current cursor position
+      const selection = window.getSelection()
+      let savedRange = null
+      
+      if (selection && selection.rangeCount > 0) {
+        savedRange = selection.getRangeAt(0).cloneRange()
+      }
+      
+      // Update content by re-rendering
+      // The content will be updated through the renderHighlightedText function
+      
+      // Restore cursor position after a brief delay to allow DOM updates
+      setTimeout(() => {
+        if (savedRange && selection) {
+          try {
+            selection.removeAllRanges()
+            selection.addRange(savedRange)
+          } catch (e) {
+            // Fallback: set cursor to end
+            const range = document.createRange()
+            range.selectNodeContents(editor)
+            range.collapse(false)
+            selection.removeAllRanges()
+            selection.addRange(range)
+          }
+        }
+      }, 0)
+    }
+  }, [value, suggestions])
 
   const getContextualWindow = (text: string, cursorPos: number) => {
     // Return the entire text for analysis
@@ -136,7 +160,13 @@ export function Editor({ content, onChange }: EditorProps) {
   }
 
   const renderHighlightedText = () => {
-    if (!value) return ""
+    if (!value) {
+      return (
+        <span className="text-gray-400 pointer-events-none select-none">
+          Start writing your marketing content here...
+        </span>
+      )
+    }
 
     // Collect all highlight regions
     const highlights: Array<{
@@ -248,7 +278,87 @@ export function Editor({ content, onChange }: EditorProps) {
     return <>{segments}</>
   }
 
+  const handleContentEditable = (e: React.FormEvent<HTMLDivElement>) => {
+    const editor = e.currentTarget
+    const newValue = editor.textContent || ''
+    const oldValue = previousText
+    
+    // Calculate where the change started by finding the first difference
+    let changeStart = 0
+    const minLength = Math.min(oldValue.length, newValue.length)
+    for (let i = 0; i < minLength; i++) {
+      if (oldValue[i] !== newValue[i]) {
+        changeStart = i
+        break
+      }
+    }
+    // If no character differences found, change starts at the end of the shorter string
+    if (changeStart === 0 && oldValue !== newValue) {
+      changeStart = minLength
+    }
+
+    setValue(newValue)
+    onChange(newValue)
+    setPreviousText(newValue)
+
+    // Update suggestion positions based on the text change
+    if (oldValue !== newValue && suggestions.length > 0) {
+      updateSuggestionPositions(oldValue, newValue, changeStart)
+    }
+
+    // Clear previous timeout and analysis window
+    if (typingTimeout) {
+      clearTimeout(typingTimeout)
+    }
+    setAnalysisWindow(null)
+
+    // Set new timeout to analyze text after user stops typing
+    const timeout = setTimeout(() => {
+      analyzeText(newValue, cursorPosition)
+    }, 2000)
+
+    setTypingTimeout(timeout)
+  }
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // Handle special key combinations
+    if (e.key === 'Tab') {
+      e.preventDefault()
+      insertTextAtCursor('\t')
+    }
+    
+    // Handle Enter key to ensure proper line breaks
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      insertTextAtCursor('\n')
+    }
+  }
+
+  const insertTextAtCursor = (text: string) => {
+    const selection = window.getSelection()
+    if (selection && selection.rangeCount > 0) {
+      const range = selection.getRangeAt(0)
+      range.deleteContents()
+      
+      const textNode = document.createTextNode(text)
+      range.insertNode(textNode)
+      
+      // Move cursor after inserted text
+      range.setStartAfter(textNode)
+      range.collapse(true)
+      selection.removeAllRanges()
+      selection.addRange(range)
+      
+      // Trigger input event to update state
+      if (editorRef.current) {
+        editorRef.current.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+    }
+  }
+
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    // This function is now replaced by handleContentEditable
+    // Keeping for backward compatibility if needed
     const newValue = e.target.value
     const newCursorPosition = e.target.selectionStart
     const oldValue = previousText
@@ -727,9 +837,44 @@ export function Editor({ content, onChange }: EditorProps) {
     )
     
     // Move cursor to the beginning of the actual text location
-    if (textareaRef.current) {
-      textareaRef.current.focus()
-      textareaRef.current.setSelectionRange(exactPosition.start, exactPosition.start)
+    if (editorRef.current) {
+      editorRef.current.focus()
+      
+      // Set cursor position in contentEditable div
+      const range = document.createRange()
+      const selection = window.getSelection()
+      
+      if (selection) {
+        // Find the text node and position
+        const walker = document.createTreeWalker(
+          editorRef.current,
+          NodeFilter.SHOW_TEXT,
+          null
+        )
+        
+        let currentPos = 0
+        let targetNode = null
+        let targetOffset = 0
+        
+        while (walker.nextNode()) {
+          const textNode = walker.currentNode as Text
+          const textLength = textNode.textContent?.length || 0
+          
+          if (currentPos + textLength >= exactPosition.start) {
+            targetNode = textNode
+            targetOffset = exactPosition.start - currentPos
+            break
+          }
+          currentPos += textLength
+        }
+        
+        if (targetNode) {
+          range.setStart(targetNode, targetOffset)
+          range.setEnd(targetNode, targetOffset)
+          selection.removeAllRanges()
+          selection.addRange(range)
+        }
+      }
     }
     
     // Update the suggestion with the corrected position
@@ -751,7 +896,7 @@ export function Editor({ content, onChange }: EditorProps) {
   }
 
   const applySuggestion = (suggestion: Suggestion) => {
-    if (!textareaRef.current) return
+    if (!editorRef.current) return
 
     // Find the exact position before applying the suggestion
     const exactPosition = findExactTextPosition(
@@ -889,36 +1034,25 @@ export function Editor({ content, onChange }: EditorProps) {
     <div className="flex flex-col gap-6 md:flex-row">
       <div className="flex-1">
         <div className="relative rounded-md border">
-          {/* Highlight overlay */}
+          {/* ContentEditable div with inline highlighting */}
           <div
-            ref={highlightRef}
-            className="absolute inset-0 pointer-events-none overflow-hidden whitespace-pre-wrap break-words text-transparent resize-none"
-            style={{
-              font: 'inherit',
-              fontSize: 'inherit',
-              fontFamily: 'inherit',
-              lineHeight: 'inherit',
-              letterSpacing: 'inherit',
-              wordSpacing: 'inherit',
-              textIndent: 'inherit',
-              padding: 'inherit',
-              border: 'inherit',
-              margin: 'inherit',
-              boxSizing: 'border-box'
+            ref={editorRef}
+            contentEditable
+            suppressContentEditableWarning={true}
+            onInput={handleContentEditable}
+            onKeyDown={handleKeyDown}
+            className={cn(
+              "min-h-[500px] resize-none p-4 text-base leading-relaxed focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 bg-background",
+              !value && "before:content-[attr(data-placeholder)] before:text-muted-foreground before:pointer-events-none before:absolute"
+            )}
+            style={{ 
+              whiteSpace: 'pre-wrap',
+              wordWrap: 'break-word'
             }}
+            data-placeholder="Start writing your marketing content here..."
           >
             {renderHighlightedText()}
           </div>
-          
-          {/* Main textarea */}
-          <Textarea
-            ref={textareaRef}
-            value={value}
-            onChange={handleChange}
-            placeholder="Start writing your marketing content here..."
-            className="min-h-[500px] resize-none p-4 text-base leading-relaxed relative z-10 bg-transparent"
-            style={{ caretColor: 'currentColor' }}
-          />
           
           {analyzing && (
             <div className="absolute bottom-4 right-4 flex items-center gap-2 rounded-md bg-muted px-3 py-1 text-sm text-muted-foreground z-20">
