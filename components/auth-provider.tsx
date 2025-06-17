@@ -31,6 +31,11 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig)
 export const auth = getAuth(app)
 export const db = getFirestore(app)
+
+// Configure Firestore settings for development
+if (typeof window !== 'undefined' && process.env.NODE_ENV === 'development') {
+  console.log('🔧 Development mode: Firebase initialized for localhost')
+}
 const googleProvider = new GoogleAuthProvider()
 
 type AuthContextType = {

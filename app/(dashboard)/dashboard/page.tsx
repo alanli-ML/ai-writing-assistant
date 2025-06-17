@@ -23,6 +23,7 @@ import { useToast } from "@/components/ui/use-toast"
 import { DashboardLayout } from "@/components/dashboard-layout"
 import { useAuth } from "@/components/auth-provider"
 import { db } from "@/components/auth-provider"
+import { AnalyticsOverview } from "@/components/analytics/analytics-dashboard"
 
 type Document = {
   id: string
@@ -112,11 +113,19 @@ export default function DashboardPage() {
   return (
     <DashboardLayout>
       <div className="flex items-center justify-between">
-        <h1 className="text-3xl font-bold">Your Documents</h1>
+        <h1 className="text-3xl font-bold">Dashboard</h1>
         <Button onClick={handleCreateDocument}>
           <PlusCircle className="mr-2 h-4 w-4" />
           New Document
         </Button>
+      </div>
+
+      {/* Analytics Overview */}
+      <AnalyticsOverview className="mb-8" />
+
+      {/* Documents Section */}
+      <div className="flex items-center justify-between">
+        <h2 className="text-2xl font-bold">Your Documents</h2>
       </div>
 
       {loading ? (

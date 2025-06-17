@@ -3,6 +3,7 @@ import { Inter } from "next/font/google"
 import { Toaster } from "@/components/ui/toaster"
 import { ThemeProvider } from "@/components/theme-provider"
 import { AuthProvider } from "@/components/auth-provider"
+import { AnalyticsProvider } from "@/hooks/use-analytics"
 
 import "./globals.css"
 
@@ -24,8 +25,10 @@ export default function RootLayout({
       <body className={inter.className}>
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
           <AuthProvider>
-            {children}
-            <Toaster />
+            <AnalyticsProvider>
+              {children}
+              <Toaster />
+            </AnalyticsProvider>
           </AuthProvider>
         </ThemeProvider>
       </body>

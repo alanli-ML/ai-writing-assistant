@@ -5,7 +5,7 @@ import type React from "react"
 import { useState } from "react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { Edit3, LayoutDashboard, FileText, Settings, LogOut, Menu } from "lucide-react"
+import { Edit3, LayoutDashboard, FileText, Settings, LogOut, Menu, BarChart3 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { useAuth } from "@/components/auth-provider"
@@ -26,6 +26,12 @@ export function DashboardLayout({ children }: DashboardLayoutProps) {
       href: "/dashboard",
       icon: LayoutDashboard,
       current: pathname === "/dashboard",
+    },
+    {
+      name: "Analytics",
+      href: "/analytics",
+      icon: BarChart3,
+      current: pathname === "/analytics",
     },
     {
       name: "Documents",

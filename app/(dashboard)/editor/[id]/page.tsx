@@ -13,7 +13,7 @@ import { Editor } from "@/components/editor"
 import { useAuth } from "@/components/auth-provider"
 import { db } from "@/components/auth-provider"
 
-export default function EditorPage({ params }: { params: { id: string } }) {
+export default function EditorPage({ params }: { params: Promise<{ id: string }> }) {
   const { user } = useAuth()
   const { toast } = useToast()
   const router = useRouter()
@@ -27,12 +27,19 @@ export default function EditorPage({ params }: { params: { id: string } }) {
   const [title, setTitle] = useState("")
   const [content, setContent] = useState("")
   const [autoSaveTimer, setAutoSaveTimer] = useState<NodeJS.Timeout | null>(null)
+  const [currentDocumentId, setCurrentDocumentId] = useState<string | null>(null)
+  const [resolvedParams, setResolvedParams] = useState<{ id: string } | null>(null)
 
-  const isNewDocument = params.id === "new"
+  const isNewDocument = resolvedParams?.id === "new"
+
+  // Resolve async params
+  useEffect(() => {
+    params.then(setResolvedParams)
+  }, [params])
 
   useEffect(() => {
     async function fetchDocument() {
-      if (!user) return
+      if (!user || !resolvedParams) return
 
       if (isNewDocument) {
         setDocument({
@@ -42,12 +49,13 @@ export default function EditorPage({ params }: { params: { id: string } }) {
         })
         setTitle("Untitled Document")
         setContent("")
+        setCurrentDocumentId(null) // No document ID yet for new documents
         setLoading(false)
         return
       }
 
       try {
-        const docRef = doc(db, "documents", params.id)
+        const docRef = doc(db, "documents", resolvedParams.id)
         const docSnap = await getDoc(docRef)
 
         if (docSnap.exists()) {
@@ -69,6 +77,7 @@ export default function EditorPage({ params }: { params: { id: string } }) {
           })
           setTitle(data.title || "Untitled Document")
           setContent(data.content || "")
+          setCurrentDocumentId(docSnap.id)
         } else {
           toast({
             variant: "destructive",
@@ -90,7 +99,7 @@ export default function EditorPage({ params }: { params: { id: string } }) {
     }
 
     fetchDocument()
-  }, [user, params.id, isNewDocument, router, toast])
+  }, [user, resolvedParams?.id, isNewDocument, router, toast])
 
   useEffect(() => {
     // Auto-save functionality
@@ -114,11 +123,11 @@ export default function EditorPage({ params }: { params: { id: string } }) {
   }, [title, content])
 
   const handleSave = async (isAutoSave = false) => {
-    if (!user) return
+    if (!user || !resolvedParams) return
 
     setSaving(true)
     try {
-      let docId = params.id
+      let docId = resolvedParams.id
 
       if (isNewDocument || !docId) {
         // Create a new document
@@ -131,6 +140,9 @@ export default function EditorPage({ params }: { params: { id: string } }) {
           content,
           timestamp: serverTimestamp(),
         })
+
+        // Set the current document ID for analytics tracking
+        setCurrentDocumentId(docId)
 
         // Update URL without refreshing the page
         router.replace(`/editor/${docId}`)
@@ -185,7 +197,11 @@ export default function EditorPage({ params }: { params: { id: string } }) {
           Save
         </Button>
       </div>
-      <Editor content={content} onChange={setContent} />
+      <Editor 
+        content={content} 
+        onChange={setContent} 
+        documentId={currentDocumentId || undefined}
+      />
     </DashboardLayout>
   )
 }

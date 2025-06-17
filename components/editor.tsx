@@ -12,6 +12,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { useToast } from "@/components/ui/use-toast"
 import { cn } from "@/lib/utils"
 import { useAuth, db } from "@/components/auth-provider"
+import { useAnalytics } from "@/hooks/use-analytics"
 
 type Suggestion = {
   id: string
@@ -31,11 +32,21 @@ type Suggestion = {
 interface EditorProps {
   content: string
   onChange: (content: string) => void
+  documentId?: string
 }
 
-export function Editor({ content, onChange }: EditorProps) {
+export function Editor({ content, onChange, documentId }: EditorProps) {
   const { toast } = useToast()
   const { user } = useAuth()
+  const { 
+    startSession,
+    currentSession,
+    trackWordsWritten, 
+    trackSuggestionShown, 
+    trackSuggestionAction,
+    userAnalytics 
+  } = useAnalytics({ enableSessionManagement: true })
+  
   const [value, setValue] = useState(content)
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [analyzing, setAnalyzing] = useState(false)
@@ -51,12 +62,25 @@ export function Editor({ content, onChange }: EditorProps) {
     preferredTone: "professional",
     writingGoals: ["clarity", "grammar"]
   })
+  
+  // Analytics tracking refs
+  const wordCountRef = useRef(0)
+  const suggestionTimestamps = useRef<Record<string, number>>({})
+  
   const editorRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     setValue(content)
     setPreviousText(content)
   }, [content])
+
+  // Initialize contentEditable content
+  useEffect(() => {
+    const editor = editorRef.current
+    if (!editor || editor.textContent === value) return
+    
+    editor.textContent = value
+  }, []) // Only run on mount
 
   // Fetch user settings when user changes
   useEffect(() => {
@@ -104,51 +128,113 @@ export function Editor({ content, onChange }: EditorProps) {
       }
     }
 
-    document.addEventListener('selectionchange', handleSelectionChange)
+        document.addEventListener('selectionchange', handleSelectionChange)
     
     return () => {
       document.removeEventListener('selectionchange', handleSelectionChange)
     }
   }, [])
 
-  // Sync contentEditable with value state and preserve cursor position
+  // Handle clicks on highlighted suggestions
   useEffect(() => {
     const editor = editorRef.current
     if (!editor) return
 
-    const currentTextContent = editor.textContent || ''
-    
-    // Only update if content actually differs to avoid cursor jumping
-    if (currentTextContent !== value) {
-      // Save current cursor position
-      const selection = window.getSelection()
-      let savedRange = null
+    const handleClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement
+      const suggestionId = target.getAttribute('data-suggestion-id')
       
-      if (selection && selection.rangeCount > 0) {
-        savedRange = selection.getRangeAt(0).cloneRange()
-      }
-      
-      // Update content by re-rendering
-      // The content will be updated through the renderHighlightedText function
-      
-      // Restore cursor position after a brief delay to allow DOM updates
-      setTimeout(() => {
-        if (savedRange && selection) {
-          try {
-            selection.removeAllRanges()
-            selection.addRange(savedRange)
-          } catch (e) {
-            // Fallback: set cursor to end
-            const range = document.createRange()
-            range.selectNodeContents(editor)
-            range.collapse(false)
-            selection.removeAllRanges()
-            selection.addRange(range)
-          }
+      if (suggestionId) {
+        e.preventDefault()
+        const suggestion = suggestions.find(s => s.id === suggestionId)
+        if (suggestion) {
+          handleSuggestionClick(suggestion)
         }
+      }
+    }
+
+    editor.addEventListener('click', handleClick)
+    
+    return () => {
+      editor.removeEventListener('click', handleClick)
+    }
+  }, [suggestions])
+
+  // Track if user is currently typing to avoid cursor interference
+  const [isTyping, setIsTyping] = useState(false)
+
+  // Manage contentEditable content updates (only when not actively typing)
+  useEffect(() => {
+    const editor = editorRef.current
+    if (!editor || isTyping) return // Don't interfere while user is typing
+
+    // Save current cursor position
+    const selection = window.getSelection()
+    let cursorOffset = 0
+    
+    if (selection && selection.rangeCount > 0 && editor.contains(selection.anchorNode)) {
+      const range = selection.getRangeAt(0)
+      const preCaretRange = range.cloneRange()
+      preCaretRange.selectNodeContents(editor)
+      preCaretRange.setEnd(range.endContainer, range.endOffset)
+      cursorOffset = preCaretRange.toString().length
+    }
+
+    // Update content to show highlights when not typing
+    const targetHTML = suggestions.length > 0 ? renderHighlightedHTML() : escapeHtml(value)
+    
+    if (editor.innerHTML !== targetHTML) {
+      editor.innerHTML = targetHTML
+      
+      // Restore cursor position after content update
+      setTimeout(() => {
+        restoreCursorPosition(cursorOffset)
       }, 0)
     }
-  }, [value, suggestions])
+  }, [value, suggestions, isTyping])
+
+  const restoreCursorPosition = (targetOffset: number) => {
+    const editor = editorRef.current
+    if (!editor) return
+
+    const selection = window.getSelection()
+    if (!selection) return
+
+    try {
+      // Walk through text nodes to find the target position
+      const walker = document.createTreeWalker(
+        editor,
+        NodeFilter.SHOW_TEXT,
+        null
+      )
+
+      let currentOffset = 0
+      let targetNode = null
+      let targetNodeOffset = 0
+
+      while (walker.nextNode()) {
+        const textNode = walker.currentNode as Text
+        const textLength = textNode.textContent?.length || 0
+
+        if (currentOffset + textLength >= targetOffset) {
+          targetNode = textNode
+          targetNodeOffset = targetOffset - currentOffset
+          break
+        }
+        currentOffset += textLength
+      }
+
+      if (targetNode) {
+        const range = document.createRange()
+        range.setStart(targetNode, Math.min(targetNodeOffset, targetNode.textContent?.length || 0))
+        range.collapse(true)
+        selection.removeAllRanges()
+        selection.addRange(range)
+      }
+    } catch (e) {
+      console.log('Could not restore cursor position:', e)
+    }
+  }
 
   const getContextualWindow = (text: string, cursorPos: number) => {
     // Return the entire text for analysis
@@ -157,6 +243,15 @@ export function Editor({ content, onChange }: EditorProps) {
       startOffset: 0,
       endOffset: text.length
     }
+  }
+
+  const determineContextCategory = (position: number, text: string): string => {
+    const textLength = text.length
+    const relativePosition = position / textLength
+    
+    if (relativePosition < 0.2) return 'introduction'
+    if (relativePosition > 0.8) return 'conclusion'
+    return 'body'
   }
 
   const renderHighlightedText = () => {
@@ -278,10 +373,120 @@ export function Editor({ content, onChange }: EditorProps) {
     return <>{segments}</>
   }
 
-  const handleContentEditable = (e: React.FormEvent<HTMLDivElement>) => {
+  const renderHighlightedHTML = (): string => {
+    if (!value) {
+      return '' // Return empty string, placeholder will be handled by CSS
+    }
+
+    // Collect all highlight regions
+    const highlights: Array<{
+      start: number
+      end: number
+      className: string
+      priority: number
+      suggestion?: Suggestion
+    }> = []
+
+    // Add highlights for all suggestions using improved fuzzy matching
+    suggestions.forEach((suggestion) => {
+      const exactPosition = findExactTextPosition(
+        value,
+        suggestion.original,
+        suggestion.position.start,
+        suggestion.position.end,
+        suggestion.contextBefore,
+        suggestion.contextAfter
+      )
+
+      if (exactPosition.found) {
+        // Verify the found text matches the original text
+        const foundText = value.substring(exactPosition.start, exactPosition.end)
+        if (foundText === suggestion.original) {
+          // Check if this is the selected suggestion for enhanced highlighting
+          const isSelected = selectedSuggestion?.id === suggestion.id
+          
+          highlights.push({
+            start: exactPosition.start,
+            end: exactPosition.end,
+            className: isSelected 
+              ? `${getHighlightColor(suggestion.type)} rounded-sm px-1 ring-2 ring-offset-1 ring-current opacity-100`
+              : `${getHighlightColor(suggestion.type)} rounded-sm px-1 opacity-60 hover:opacity-80 cursor-pointer`,
+            priority: isSelected ? 2 : 1,
+            suggestion: suggestion
+          })
+        }
+      }
+    })
+
+    // If no highlights, return plain text
+    if (highlights.length === 0) {
+      return escapeHtml(value)
+    }
+
+    // Sort highlights by priority and position
+    highlights.sort((a, b) => b.priority - a.priority || a.start - b.start)
+
+    // Create HTML string with highlights
+    let html = ''
+    let currentPos = 0
+
+    // Use the highest priority highlight that overlaps with each position
+    for (let i = 0; i < value.length; i++) {
+      const applicableHighlight = highlights.find(h => i >= h.start && i < h.end)
+      
+      if (applicableHighlight) {
+        // Add any plain text before this highlight
+        if (currentPos < applicableHighlight.start) {
+          html += escapeHtml(value.substring(currentPos, applicableHighlight.start))
+        }
+
+        // Add the highlighted text
+        const suggestionData = applicableHighlight.suggestion 
+          ? ` data-suggestion-id="${applicableHighlight.suggestion.id}" title="${escapeHtml(applicableHighlight.suggestion.type)}: ${escapeHtml(applicableHighlight.suggestion.explanation)}"` 
+          : ''
+        
+        html += `<span class="${applicableHighlight.className}"${suggestionData}>${escapeHtml(value.substring(applicableHighlight.start, applicableHighlight.end))}</span>`
+
+        // Move current position to end of this highlight
+        currentPos = applicableHighlight.end
+        i = applicableHighlight.end - 1 // -1 because loop will increment
+      }
+    }
+
+    // Add any remaining plain text
+    if (currentPos < value.length) {
+      html += escapeHtml(value.substring(currentPos))
+    }
+
+    return html
+  }
+
+  const escapeHtml = (text: string): string => {
+    // Server-safe HTML escaping
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+      .replace(/\n/g, '<br/>')
+  }
+
+    const handleContentEditable = (e: React.FormEvent<HTMLDivElement>) => {
     const editor = e.currentTarget
     const newValue = editor.textContent || ''
     const oldValue = previousText
+    
+    // Only proceed if content actually changed
+    if (newValue === oldValue) return
+    
+    // Start a writing session if user starts writing and no session is active
+    if (!currentSession && user && newValue.trim().length > 0) {
+              startSession?.().catch(console.error)
+    }
+    
+    // Mark as typing to prevent cursor interference
+    setIsTyping(true)
     
     // Calculate where the change started by finding the first difference
     let changeStart = 0
@@ -301,8 +506,19 @@ export function Editor({ content, onChange }: EditorProps) {
     onChange(newValue)
     setPreviousText(newValue)
 
+    // Track words written for analytics
+    const oldWordCount = oldValue.trim().split(/\s+/).filter(word => word.length > 0).length
+    const newWordCount = newValue.trim().split(/\s+/).filter(word => word.length > 0).length
+    const wordsAdded = Math.max(0, newWordCount - oldWordCount)
+    
+    if (wordsAdded > 0 && documentId) {
+              trackWordsWritten?.(wordsAdded, documentId).catch(console.error)
+    }
+    
+    wordCountRef.current = newWordCount
+
     // Update suggestion positions based on the text change
-    if (oldValue !== newValue && suggestions.length > 0) {
+    if (suggestions.length > 0) {
       updateSuggestionPositions(oldValue, newValue, changeStart)
     }
 
@@ -314,10 +530,16 @@ export function Editor({ content, onChange }: EditorProps) {
 
     // Set new timeout to analyze text after user stops typing
     const timeout = setTimeout(() => {
+      setIsTyping(false) // Stop typing mode before analysis
       analyzeText(newValue, cursorPosition)
     }, 2000)
 
     setTypingTimeout(timeout)
+    
+    // Clear typing state after a shorter delay for immediate feedback
+    setTimeout(() => {
+      setIsTyping(false)
+    }, 500) // Balanced delay for typing experience
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -331,6 +553,16 @@ export function Editor({ content, onChange }: EditorProps) {
     if (e.key === 'Enter') {
       e.preventDefault()
       insertTextAtCursor('\n')
+    }
+    
+    // Show highlights immediately when user navigates (doesn't change content)
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(e.key)) {
+      setIsTyping(false)
+    }
+    
+    // Show highlights when user presses Escape (common UI pattern)
+    if (e.key === 'Escape') {
+      setIsTyping(false)
     }
   }
 
@@ -363,6 +595,11 @@ export function Editor({ content, onChange }: EditorProps) {
     const newCursorPosition = e.target.selectionStart
     const oldValue = previousText
     
+    // Start a writing session if user starts writing and no session is active
+    if (!currentSession && user && newValue.trim().length > 0) {
+      startSession?.().catch(console.error)
+    }
+    
     // Calculate where the change started by finding the first difference
     let changeStart = 0
     const minLength = Math.min(oldValue.length, newValue.length)
@@ -376,7 +613,7 @@ export function Editor({ content, onChange }: EditorProps) {
     if (changeStart === 0 && oldValue !== newValue) {
       changeStart = minLength
     }
-
+    
     setValue(newValue)
     onChange(newValue)
     setCursorPosition(newCursorPosition)
@@ -502,6 +739,23 @@ export function Editor({ content, onChange }: EditorProps) {
       })))
 
       setSuggestions(correctedSuggestions)
+      
+      // Track suggestions shown for analytics
+      if (correctedSuggestions.length > 0 && documentId) {
+        correctedSuggestions.forEach((suggestion: Suggestion) => {
+          // Record when suggestion was shown
+          suggestionTimestamps.current[suggestion.id] = Date.now()
+          
+          // Track suggestion shown in analytics
+          trackSuggestionShown?.(suggestion.id, {
+            type: suggestion.type,
+            confidence: suggestion.confidence,
+            documentId,
+            textLength: suggestion.original.length,
+            contextCategory: determineContextCategory(suggestion.position.start, text)
+          }).catch(console.error)
+        })
+      }
     } catch (error) {
       console.error("Error analyzing text:", error)
       toast({
@@ -532,10 +786,10 @@ export function Editor({ content, onChange }: EditorProps) {
     
     // First, try the exact positions provided by the API
     if (startPos >= 0 && endPos <= text.length && startPos < endPos) {
-      const exactMatch = text.substring(startPos, endPos)
-      if (exactMatch === searchText) {
+    const exactMatch = text.substring(startPos, endPos)
+    if (exactMatch === searchText) {
         console.log("✅ Found exact match at suggested position")
-        return { start: startPos, end: endPos, found: true }
+      return { start: startPos, end: endPos, found: true }
       }
       console.log("❌ No match at suggested position. Expected:", searchText, "Got:", exactMatch)
     }
@@ -979,6 +1233,15 @@ export function Editor({ content, onChange }: EditorProps) {
     setSuggestions(updatedSuggestions)
     setSelectedSuggestion(null)
     
+    // Track suggestion acceptance for analytics
+    const responseTime = suggestionTimestamps.current[suggestion.id] 
+      ? (Date.now() - suggestionTimestamps.current[suggestion.id]) / 1000 
+      : 0
+    
+    if (documentId) {
+      trackSuggestionAction?.(suggestion.id, 'accepted', responseTime).catch(console.error)
+    }
+    
     // Clear analysis window after applying suggestion
     setAnalysisWindow(null)
 
@@ -997,6 +1260,15 @@ export function Editor({ content, onChange }: EditorProps) {
       position: dismissedSuggestion?.position,
       remainingAfterDismissal: suggestions.length - 1
     })
+    
+    // Track suggestion dismissal for analytics
+    const responseTime = suggestionTimestamps.current[suggestionId] 
+      ? (Date.now() - suggestionTimestamps.current[suggestionId]) / 1000 
+      : 0
+    
+    if (documentId) {
+      trackSuggestionAction?.(suggestionId, 'dismissed', responseTime).catch(console.error)
+    }
     
     setSuggestions(suggestions.filter((s) => s.id !== suggestionId))
     if (selectedSuggestion?.id === suggestionId) {
@@ -1034,13 +1306,19 @@ export function Editor({ content, onChange }: EditorProps) {
     <div className="flex flex-col gap-6 md:flex-row">
       <div className="flex-1">
         <div className="relative rounded-md border">
-          {/* ContentEditable div with inline highlighting */}
+                    {/* Single ContentEditable div with managed content updates */}
           <div
             ref={editorRef}
             contentEditable
             suppressContentEditableWarning={true}
             onInput={handleContentEditable}
             onKeyDown={handleKeyDown}
+            onFocus={() => {
+              // Don't immediately clear typing state on focus
+            }}
+            onBlur={() => {
+              setIsTyping(false) // Always clear typing state when editor loses focus
+            }}
             className={cn(
               "min-h-[500px] resize-none p-4 text-base leading-relaxed focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 bg-background",
               !value && "before:content-[attr(data-placeholder)] before:text-muted-foreground before:pointer-events-none before:absolute"
@@ -1050,9 +1328,7 @@ export function Editor({ content, onChange }: EditorProps) {
               wordWrap: 'break-word'
             }}
             data-placeholder="Start writing your marketing content here..."
-          >
-            {renderHighlightedText()}
-          </div>
+          />
           
           {analyzing && (
             <div className="absolute bottom-4 right-4 flex items-center gap-2 rounded-md bg-muted px-3 py-1 text-sm text-muted-foreground z-20">
