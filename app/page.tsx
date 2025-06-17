@@ -27,24 +27,19 @@ export default function Home() {
         <section className="container space-y-6 py-24 md:py-32">
           <div className="mx-auto flex max-w-[58rem] flex-col items-center space-y-4 text-center">
             <h1 className="text-4xl font-bold tracking-tight sm:text-5xl md:text-6xl">
-              Elevate Your Marketing Copy with{" "}
+              Elevate Your Writing with{" "}
               <span className="bg-gradient-to-r from-primary to-blue-600 bg-clip-text text-transparent">
                 AI-Powered Insights
               </span>
             </h1>
             <p className="max-w-[42rem] text-muted-foreground sm:text-xl">
-              Real-time feedback on clarity, tone, and persuasion for marketing professionals. Write with confidence and
+              Real-time feedback on clarity, tone, and persuasion. Write with confidence and
               impact.
             </p>
             <div className="flex flex-wrap items-center justify-center gap-4">
               <Link href="/signup">
                 <Button size="lg" className="gap-2">
                   Get Started <ArrowRight className="h-4 w-4" />
-                </Button>
-              </Link>
-              <Link href="/demo">
-                <Button size="lg" variant="outline">
-                  Try Demo
                 </Button>
               </Link>
             </div>
@@ -58,7 +53,7 @@ export default function Home() {
               </div>
               <h3 className="text-xl font-bold">Smart Suggestions</h3>
               <p className="text-muted-foreground">
-                Get contextual recommendations to improve clarity, tone, and persuasion in your marketing copy.
+                Get contextual recommendations to improve clarity, tone, and persuasion.
               </p>
             </div>
             <div className="flex flex-col items-center space-y-2 rounded-lg border p-6 text-center">

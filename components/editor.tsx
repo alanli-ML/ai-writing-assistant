@@ -60,7 +60,7 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
     writingGoals: string[]
   }>({
     preferredTone: "professional",
-    writingGoals: ["clarity", "grammar"]
+    writingGoals: ["clarity", "persuasion", "grammar", "tone", "brevity", "consistency"]
   })
   
   // Analytics tracking refs
@@ -95,7 +95,7 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
           const data = userDoc.data()
           setUserSettings({
             preferredTone: data.preferredTone || "professional",
-            writingGoals: data.writingGoals || ["clarity", "grammar"]
+            writingGoals: data.writingGoals || ["clarity", "persuasion", "grammar", "tone", "brevity", "consistency"]
           })
         }
       } catch (error) {

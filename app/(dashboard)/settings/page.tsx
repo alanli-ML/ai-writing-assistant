@@ -34,6 +34,7 @@ const writingGoalOptions = [
   { id: "grammar", label: "Fix grammar issues" },
   { id: "tone", label: "Adjust tone" },
   { id: "brevity", label: "Increase brevity" },
+  { id: "consistency", label: "Enhance consistency" },
 ]
 
 export default function SettingsPage() {
@@ -47,7 +48,7 @@ export default function SettingsPage() {
     defaultValues: {
       displayName: "",
       preferredTone: "professional",
-      writingGoals: ["clarity", "grammar"],
+      writingGoals: ["clarity", "persuasion", "grammar", "tone", "brevity", "consistency"],
       feedbackOptIn: true,
     },
   })
@@ -65,7 +66,7 @@ export default function SettingsPage() {
           form.reset({
             displayName: data.displayName || user.displayName || "",
             preferredTone: data.preferredTone || "professional",
-            writingGoals: data.writingGoals || ["clarity", "grammar"],
+            writingGoals: data.writingGoals || ["clarity", "persuasion", "grammar", "tone", "brevity", "consistency"],
             feedbackOptIn: data.feedbackOptIn !== false,
           })
         } else {
@@ -73,7 +74,7 @@ export default function SettingsPage() {
           form.reset({
             displayName: user.displayName || "",
             preferredTone: "professional",
-            writingGoals: ["clarity", "grammar"],
+            writingGoals: ["clarity", "persuasion", "grammar", "tone", "brevity", "consistency"],
             feedbackOptIn: true,
           })
         }
