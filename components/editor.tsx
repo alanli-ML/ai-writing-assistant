@@ -14,6 +14,9 @@ import { cn } from "@/lib/utils"
 import { useAuth, db } from "@/components/auth-provider"
 import { useAnalytics } from "@/hooks/use-analytics"
 
+// Dynamic import for client-side spell checking library
+let typoModule: any = null
+
 type Suggestion = {
   id: string
   type: "grammar" | "tone" | "persuasion"
@@ -67,6 +70,10 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
   const wordCountRef = useRef(0)
   const suggestionTimestamps = useRef<Record<string, number>>({})
   
+  // Track if auto-analysis has been done for current document to prevent loops
+  const autoAnalysisCompleted = useRef<boolean>(false)
+  const lastDocumentId = useRef<string | undefined>(undefined)
+  
   const editorRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -106,6 +113,43 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
 
     fetchUserSettings()
   }, [user])
+
+  // Auto-analyze existing content when document is opened
+  useEffect(() => {
+    // Reset auto-analysis flag when document changes
+    if (lastDocumentId.current !== documentId) {
+      lastDocumentId.current = documentId
+      autoAnalysisCompleted.current = false
+    }
+    
+    // Only analyze if:
+    // 1. There's meaningful content (more than 10 characters)
+    // 2. User settings are loaded
+    // 3. User is authenticated
+    // 4. Content is not empty or just whitespace
+    // 5. We haven't already auto-analyzed this document
+    // 6. We're not currently analyzing
+    if (
+      content && 
+      content.trim().length > 10 && 
+      user && 
+      userSettings.preferredTone && 
+      !autoAnalysisCompleted.current &&
+      !analyzing
+    ) {
+      console.log(`📄 Document opened with existing content (${documentId || 'no-id'}), auto-analyzing...`)
+      
+      // Mark this document as being auto-analyzed to prevent loops
+      autoAnalysisCompleted.current = true
+      
+      // Add a small delay to ensure UI is ready
+      const timeout = setTimeout(() => {
+        analyzeTextAutomatic(content)
+      }, 500)
+
+      return () => clearTimeout(timeout)
+    }
+  }, [content, documentId, user, userSettings.preferredTone])
 
   // Handle cursor position tracking for contentEditable
   useEffect(() => {
@@ -522,17 +566,22 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
       updateSuggestionPositions(oldValue, newValue, changeStart)
     }
 
-    // Clear previous timeout and analysis window
-    if (typingTimeout) {
-      clearTimeout(typingTimeout)
-    }
-    setAnalysisWindow(null)
+          // Clear previous timeout and analysis window
+      if (typingTimeout) {
+        clearTimeout(typingTimeout)
+      }
+      setAnalysisWindow(null)
 
-    // Set new timeout to analyze text after user stops typing
-    const timeout = setTimeout(() => {
-      setIsTyping(false) // Stop typing mode before analysis
-      analyzeText(newValue, cursorPosition)
-    }, 2000)
+      // Clear all suggestions if text is empty
+      if (newValue.trim().length === 0) {
+        setSuggestions([])
+      }
+
+      // Set new timeout to analyze text after user stops typing
+      const timeout = setTimeout(() => {
+        setIsTyping(false) // Stop typing mode before analysis
+        analyzeTextAutomatic(newValue)
+      }, 2000)
 
     setTypingTimeout(timeout)
     
@@ -632,13 +681,287 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
 
     // Set new timeout to analyze text after user stops typing
     const timeout = setTimeout(() => {
-      analyzeText(newValue, newCursorPosition)
+      analyzeTextAutomatic(newValue)
     }, 2000)
 
     setTypingTimeout(timeout)
   }
 
-  const analyzeText = async (text: string, cursorPos: number = cursorPosition) => {
+  // Function to load Typo.js dynamically
+  const loadTextCheckers = async () => {
+    if (!typoModule) {
+      try {
+        // Load Typo.js library
+        const typoImport = await import('typo-js' as any)
+        typoModule = typoImport.default || typoImport
+        
+        console.log("✅ Loaded Typo.js spell checking library successfully")
+      } catch (error) {
+        console.error("Failed to load Typo.js library:", error)
+        throw error
+      }
+    }
+    return { typo: typoModule }
+  }
+
+  // Intelligent suggestion merging - keeps existing valid suggestions and adds new ones
+  const mergeSuggestionsIntelligently = (
+    existingSuggestions: Suggestion[], 
+    newSuggestions: Suggestion[], 
+    currentText: string
+  ): Suggestion[] => {
+    console.log("🔄 Merging suggestions intelligently...")
+    
+    // 1. Filter out existing suggestions that are no longer valid (text changed)
+    const validExistingSuggestions = existingSuggestions.filter(suggestion => {
+      const currentTextAtPosition = currentText.substring(
+        suggestion.position.start, 
+        suggestion.position.end
+      )
+      const isStillValid = currentTextAtPosition === suggestion.original
+      
+      if (!isStillValid) {
+        console.log(`❌ Removing invalid suggestion: "${suggestion.original}" (text changed to "${currentTextAtPosition}")`)
+      }
+      
+      return isStillValid
+    })
+    
+    // 2. Remove overlapping suggestions (newer ones take precedence)
+    const mergedSuggestions: Suggestion[] = [...validExistingSuggestions]
+    
+    newSuggestions.forEach(newSuggestion => {
+      // Check if this new suggestion overlaps with any existing ones
+      const overlappingIndices: number[] = []
+      
+      mergedSuggestions.forEach((existingSuggestion, index) => {
+        const newStart = newSuggestion.position.start
+        const newEnd = newSuggestion.position.end
+        const existingStart = existingSuggestion.position.start
+        const existingEnd = existingSuggestion.position.end
+        
+        // Check for overlap
+        const overlaps = (newStart < existingEnd && newEnd > existingStart)
+        
+        if (overlaps) {
+          overlappingIndices.push(index)
+          console.log(`🔄 New suggestion "${newSuggestion.original}" overlaps with existing "${existingSuggestion.original}"`)
+        }
+      })
+      
+      // Remove overlapping existing suggestions (in reverse order to maintain indices)
+      overlappingIndices.reverse().forEach(index => {
+        const removed = mergedSuggestions.splice(index, 1)[0]
+        console.log(`❌ Removed overlapping suggestion: "${removed.original}"`)
+      })
+      
+      // Add the new suggestion
+      mergedSuggestions.push(newSuggestion)
+      console.log(`✅ Added new suggestion: "${newSuggestion.original}"`)
+    })
+    
+    // 3. Sort suggestions by position for consistent ordering
+    mergedSuggestions.sort((a, b) => a.position.start - b.position.start)
+    
+    console.log(`📊 Merge complete: ${validExistingSuggestions.length} valid existing + ${newSuggestions.length} new = ${mergedSuggestions.length} total`)
+    
+    return mergedSuggestions
+  }
+
+    // Fast automatic analysis: immediate Typo.js + background OpenAI
+  const analyzeTextAutomatic = async (text: string) => {
+    if (!text || text.length < 5) {
+      setSuggestions([])
+      setAnalysisWindow(null)
+      return
+    }
+
+    console.log("🔍 Running immediate Typo.js analysis + background OpenAI")
+    setAnalyzing(true)
+    
+    try {
+      let suggestionIdCounter = 0
+      
+      // 1. IMMEDIATE TYPO.JS SPELL CHECKING
+      const typoSuggestions: Suggestion[] = []
+      try {
+        // Load Typo.js library dynamically
+        const { typo: Typo } = await loadTextCheckers()
+        
+        // Initialize Typo.js dictionary for spellchecking
+        let dictionary: any = null
+        try {
+          const [affData, dicData] = await Promise.all([
+            fetch('/dictionaries/en_US.aff').then(res => res.text()),
+            fetch('/dictionaries/en_US.dic').then(res => res.text())
+          ])
+          
+          dictionary = new Typo("en_US", affData, dicData)
+          console.log("✅ Initialized Typo.js dictionary")
+        } catch (error) {
+          console.log("ℹ️ Typo.js dictionary not available")
+        }
+        
+        if (dictionary) {
+          const words = text.match(/\b[a-zA-Z]+\b/g) || []
+          const uniqueWords = [...new Set(words)]
+          
+          console.log(`🔤 Spellchecking ${uniqueWords.length} unique words`)
+          
+          uniqueWords.forEach((word) => {
+            if (word.length < 2) return
+            
+            const isCorrect = dictionary.check(word)
+            if (!isCorrect) {
+              const suggestions = dictionary.suggest(word, 3)
+              if (suggestions && suggestions.length > 0) {
+                let searchIndex = text.indexOf(word)
+                while (searchIndex !== -1) {
+                  const suggestion: Suggestion = {
+                    id: `typo-${suggestionIdCounter++}-${Date.now()}`,
+                    type: "grammar",
+                    position: {
+                      start: searchIndex,
+                      end: searchIndex + word.length
+                    },
+                    original: word,
+                    suggested: suggestions[0],
+                    contextBefore: getContextBefore(text, searchIndex),
+                    contextAfter: getContextAfter(text, searchIndex + word.length),
+                    explanation: `Spelling: "${word}" may be misspelled. Did you mean "${suggestions[0]}"?`,
+                    confidence: 0.8
+                  }
+                  
+                  typoSuggestions.push(suggestion)
+                  searchIndex = text.indexOf(word, searchIndex + 1)
+                }
+              }
+            }
+          })
+        }
+      } catch (error) {
+        console.log("⚠️ Typo.js analysis failed:", error)
+      }
+      
+      // 2. IMMEDIATELY SHOW TYPO.JS SUGGESTIONS
+      if (typoSuggestions.length > 0) {
+        const mergedWithTypo = mergeSuggestionsIntelligently(suggestions, typoSuggestions, text)
+        setSuggestions(mergedWithTypo)
+        
+        console.log(`⚡ Immediate: Added ${typoSuggestions.length} Typo.js suggestions`)
+        
+        // Track immediate suggestions for analytics
+        const newTypoSuggestions = mergedWithTypo.filter((s: Suggestion) => 
+          !suggestions.some(existing => existing.id === s.id)
+        )
+        
+        if (newTypoSuggestions.length > 0 && documentId) {
+          newTypoSuggestions.forEach((suggestion: Suggestion) => {
+            suggestionTimestamps.current[suggestion.id] = Date.now()
+            trackSuggestionShown?.(suggestion.id, {
+              type: suggestion.type,
+              confidence: suggestion.confidence,
+              documentId,
+              textLength: suggestion.original.length,
+              contextCategory: determineContextCategory(suggestion.position.start, text)
+            }).catch(console.error)
+          })
+        }
+      }
+
+      // 3. BACKGROUND OPENAI API ANALYSIS
+      console.log("🧠 Starting background OpenAI analysis...")
+      
+      // Don't await this - let it run in background
+      fetch('/api/analyze', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: text,
+          preferredTone: userSettings.preferredTone,
+          writingGoals: userSettings.writingGoals
+        }),
+      })
+      .then(async (response) => {
+        if (response.ok) {
+          const data = await response.json()
+          
+          if (data.suggestions && Array.isArray(data.suggestions)) {
+            // Correct OpenAI suggestion positions
+            const correctedOpenAISuggestions = data.suggestions
+              .map((suggestion: Suggestion): Suggestion | null => {
+                const exactPosition = findExactTextPosition(
+                  text,
+                  suggestion.original,
+                  suggestion.position.start,
+                  suggestion.position.end,
+                  suggestion.contextBefore,
+                  suggestion.contextAfter
+                )
+
+                if (exactPosition.found) {
+                  return {
+                    ...suggestion,
+                    id: `openai-${suggestionIdCounter++}-${Date.now()}`,
+                    position: {
+                      start: exactPosition.start,
+                      end: exactPosition.end
+                    }
+                  }
+                } else {
+                  console.log(`❌ Could not locate OpenAI suggestion: "${suggestion.original}"`)
+                  return null
+                }
+              })
+              .filter((s: Suggestion | null): s is Suggestion => s !== null)
+
+            if (correctedOpenAISuggestions.length > 0) {
+              // Merge OpenAI suggestions with current suggestions
+              setSuggestions(currentSuggestions => {
+                const merged = mergeSuggestionsIntelligently(currentSuggestions, correctedOpenAISuggestions, text)
+                console.log(`🧠 Background: Added ${correctedOpenAISuggestions.length} OpenAI suggestions`)
+                return merged
+              })
+              
+              // Track OpenAI suggestions for analytics
+              if (documentId) {
+                correctedOpenAISuggestions.forEach((suggestion: Suggestion) => {
+                  suggestionTimestamps.current[suggestion.id] = Date.now()
+                  trackSuggestionShown?.(suggestion.id, {
+                    type: suggestion.type,
+                    confidence: suggestion.confidence,
+                    documentId,
+                    textLength: suggestion.original.length,
+                    contextCategory: determineContextCategory(suggestion.position.start, text)
+                  }).catch(console.error)
+                })
+              }
+            }
+          }
+        } else {
+          console.log("⚠️ OpenAI API request failed:", response.status)
+        }
+      })
+      .catch((error) => {
+        console.log("⚠️ Background OpenAI analysis failed:", error)
+      })
+      .finally(() => {
+        // Stop analyzing spinner when OpenAI analysis is complete (success or failure)
+        setAnalyzing(false)
+        console.log("🔄 Analysis complete - spinner stopped")
+      })
+
+    } catch (error) {
+      console.error("Error with automatic analysis:", error)
+      // Don't show error toast for automatic analysis to avoid interrupting user
+      setAnalyzing(false) // Stop spinner on immediate error
+    }
+  }
+
+  // Comprehensive analysis using OpenAI for manual analysis button
+  const analyzeTextManual = async (text: string, cursorPos: number = cursorPosition) => {
     if (!text || text.length < 20) {
       setSuggestions([])
       setAnalysisWindow(null)
@@ -660,7 +983,9 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
       end: contextWindow.endOffset
     })
 
+    console.log("🧠 Running comprehensive analysis with OpenAI")
     setAnalyzing(true)
+    
     try {
       const response = await fetch('/api/analyze', {
         method: 'POST',
@@ -727,7 +1052,7 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
         .filter((s: Suggestion | null): s is Suggestion => s !== null) // Remove suggestions we couldn't locate
 
       // Log received suggestions
-      console.log("🎯 Suggestions received from API:", adjustedSuggestions.length)
+      console.log("🎯 OpenAI suggestions received:", adjustedSuggestions.length)
       console.log("✅ Suggestions with corrected positions:", correctedSuggestions.length)
       console.log("📍 Final suggestion positions:", correctedSuggestions.map((s: Suggestion) => ({
         id: s.id,
@@ -738,11 +1063,17 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
         textAtPosition: text.substring(s.position.start, s.position.end)
       })))
 
-      setSuggestions(correctedSuggestions)
+      // Use intelligent merging for manual analysis too
+      const mergedSuggestions = mergeSuggestionsIntelligently(suggestions, correctedSuggestions, text)
+      setSuggestions(mergedSuggestions)
       
-      // Track suggestions shown for analytics
-      if (correctedSuggestions.length > 0 && documentId) {
-        correctedSuggestions.forEach((suggestion: Suggestion) => {
+      // Track new suggestions for analytics
+      const newSuggestionsFromManual = mergedSuggestions.filter((s: Suggestion) => 
+        !suggestions.some(existing => existing.id === s.id)
+      )
+      
+      if (newSuggestionsFromManual.length > 0 && documentId) {
+        newSuggestionsFromManual.forEach((suggestion: Suggestion) => {
           // Record when suggestion was shown
           suggestionTimestamps.current[suggestion.id] = Date.now()
           
@@ -1374,7 +1705,7 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
                     variant="ghost"
                     size="sm"
                     className="h-8 w-8 p-0"
-                    onClick={() => analyzeText(value, cursorPosition)}
+                    onClick={() => analyzeTextManual(value, cursorPosition)}
                     disabled={analyzing}
                   >
                     {analyzing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
@@ -1475,4 +1806,342 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
       )}
     </div>
   )
+}
+
+// Helper functions for client-side grammarify processing
+type TextSegment = {
+  text: string
+  startIndex: number
+  endIndex: number
+}
+
+function splitTextIntoSegments(text: string): TextSegment[] {
+  const segments: TextSegment[] = []
+  
+  // Split by double newlines first (paragraphs)
+  const paragraphs = text.split(/\n\s*\n/)
+  let currentIndex = 0
+  
+  for (const paragraph of paragraphs) {
+    if (paragraph.trim().length === 0) {
+      currentIndex += paragraph.length + 2 // Account for the double newline
+      continue
+    }
+    
+    // Find the actual start position of this paragraph in the original text
+    const paragraphStart = text.indexOf(paragraph, currentIndex)
+    
+    // Split paragraph into sentences
+    const sentences = splitIntoSentences(paragraph)
+    let sentenceStartInParagraph = 0
+    
+    for (const sentence of sentences) {
+      if (sentence.trim().length < 3) {
+        sentenceStartInParagraph += sentence.length
+        continue
+      }
+      
+      // Find the position of this sentence within the paragraph
+      const sentenceStart = paragraph.indexOf(sentence, sentenceStartInParagraph)
+      const actualStart = paragraphStart + sentenceStart
+      const actualEnd = actualStart + sentence.length
+      
+      segments.push({
+        text: sentence,
+        startIndex: actualStart,
+        endIndex: actualEnd
+      })
+      
+      sentenceStartInParagraph = sentenceStart + sentence.length
+    }
+    
+    currentIndex = paragraphStart + paragraph.length + 2 // Move past this paragraph and newlines
+  }
+  
+  // If no segments were created (single paragraph, no clear sentences), use the whole text
+  if (segments.length === 0) {
+    segments.push({
+      text: text,
+      startIndex: 0,
+      endIndex: text.length
+    })
+  }
+  
+  return segments
+}
+
+function splitIntoSentences(text: string): string[] {
+  // Split on sentence endings, but be careful with abbreviations and numbers
+  const sentences: string[] = []
+  const sentenceEnders = /[.!?]+/g
+  let lastIndex = 0
+  let match
+  
+  while ((match = sentenceEnders.exec(text)) !== null) {
+    const endIndex = match.index + match[0].length
+    const potentialSentence = text.substring(lastIndex, endIndex).trim()
+    
+    // Check if this is likely a real sentence ending (not an abbreviation or decimal)
+    const nextChar = text[endIndex]
+    const prevChar = text[match.index - 1]
+    
+    // Simple heuristics to avoid splitting on abbreviations or decimals
+    const isLikelyAbbreviation = prevChar && prevChar.match(/[A-Z]/) && potentialSentence.length < 10
+    const isDecimal = prevChar && prevChar.match(/\d/) && nextChar && nextChar.match(/\d/)
+    
+    if (!isLikelyAbbreviation && !isDecimal && (nextChar === undefined || nextChar.match(/\s/) || nextChar.match(/[A-Z]/))) {
+      if (potentialSentence.length > 0) {
+        sentences.push(potentialSentence)
+      }
+      lastIndex = endIndex
+    }
+  }
+  
+  // Add any remaining text as a sentence
+  const remaining = text.substring(lastIndex).trim()
+  if (remaining.length > 0) {
+    sentences.push(remaining)
+  }
+  
+  return sentences.length > 0 ? sentences : [text] // Fallback to whole text if no sentences found
+}
+
+// IMPROVED text difference detection algorithm
+function findImprovedTextDifferences(original: string, cleaned: string) {
+  const diffs = []
+  
+  // Use a more sophisticated word-boundary aware algorithm
+  const originalWords = tokenizeText(original)
+  const cleanedWords = tokenizeText(cleaned)
+  
+  // Find differences using a simple LCS-like approach
+  let origIndex = 0
+  let cleanIndex = 0
+  
+  while (origIndex < originalWords.length || cleanIndex < cleanedWords.length) {
+    // If we've reached the end of one array
+    if (origIndex >= originalWords.length) {
+      // All remaining cleaned words are additions
+      const addedText = cleanedWords.slice(cleanIndex).map(w => w.text).join('')
+      if (addedText.trim()) {
+        diffs.push({
+          start: original.length,
+          end: original.length,
+          original: '',
+          suggested: addedText
+        })
+      }
+      break
+    }
+    
+    if (cleanIndex >= cleanedWords.length) {
+      // All remaining original words are deletions
+      const deletedText = originalWords.slice(origIndex).map(w => w.text).join('')
+      const startPos = originalWords[origIndex].start
+      if (isValidDifference(deletedText, '')) {
+        diffs.push({
+          start: startPos,
+          end: original.length,
+          original: deletedText,
+          suggested: ''
+        })
+      }
+      break
+    }
+    
+    const origWord = originalWords[origIndex]
+    const cleanWord = cleanedWords[cleanIndex]
+    
+    // If words match exactly, continue
+    if (origWord.text === cleanWord.text) {
+      origIndex++
+      cleanIndex++
+      continue
+    }
+    
+    // Look ahead to find the next matching point
+    let matchFound = false
+    const lookAhead = 3 // How many words to look ahead
+    
+    for (let i = 1; i <= lookAhead && !matchFound; i++) {
+      // Check if original[origIndex] matches cleaned[cleanIndex + i]
+      if (cleanIndex + i < cleanedWords.length && 
+          origWord.text === cleanedWords[cleanIndex + i].text) {
+        // Found a match - words were inserted in cleaned
+        const insertedText = cleanedWords.slice(cleanIndex, cleanIndex + i).map(w => w.text).join('')
+        if (insertedText.trim() && isValidDifference('', insertedText)) {
+          diffs.push({
+            start: origWord.start,
+            end: origWord.start,
+            original: '',
+            suggested: insertedText
+          })
+        }
+        cleanIndex += i
+        matchFound = true
+        break
+      }
+      
+      // Check if original[origIndex + i] matches cleaned[cleanIndex]
+      if (origIndex + i < originalWords.length && 
+          originalWords[origIndex + i].text === cleanWord.text) {
+        // Found a match - words were deleted from original
+        const deletedText = originalWords.slice(origIndex, origIndex + i).map(w => w.text).join('')
+        const startPos = origWord.start
+        const endPos = originalWords[origIndex + i - 1].end
+        if (isValidDifference(deletedText, '')) {
+          diffs.push({
+            start: startPos,
+            end: endPos,
+            original: deletedText,
+            suggested: ''
+          })
+        }
+        origIndex += i
+        matchFound = true
+        break
+      }
+    }
+    
+    if (!matchFound) {
+      // Direct substitution - find the extent of the change
+      let origEndIndex = origIndex + 1
+      let cleanEndIndex = cleanIndex + 1
+      
+      // Create the substitution diff
+      const originalText = originalWords.slice(origIndex, origEndIndex).map(w => w.text).join('')
+      const suggestedText = cleanedWords.slice(cleanIndex, cleanEndIndex).map(w => w.text).join('')
+      
+      if (isValidDifference(originalText, suggestedText)) {
+        diffs.push({
+          start: origWord.start,
+          end: originalWords[origEndIndex - 1]?.end || origWord.end,
+          original: originalText,
+          suggested: suggestedText
+        })
+      }
+      
+      origIndex = origEndIndex
+      cleanIndex = cleanEndIndex
+    }
+  }
+  
+  return consolidateDifferences(diffs)
+}
+
+function tokenizeText(text: string) {
+  const tokens = []
+  const wordRegex = /\S+|\s+/g
+  let match
+  
+  while ((match = wordRegex.exec(text)) !== null) {
+    tokens.push({
+      text: match[0],
+      start: match.index,
+      end: match.index + match[0].length
+    })
+  }
+  
+  return tokens
+}
+
+function isValidDifference(original: string, suggested: string): boolean {
+  // Filter out questionable suggestions
+  
+  // Don't suggest single character removals unless it's clearly whitespace or punctuation
+  if (original.length === 1 && suggested === '') {
+    return /[\s.!?'"(),-]/.test(original) // Only allow removing whitespace or punctuation
+  }
+  
+  // Don't suggest adding single characters unless it's meaningful punctuation
+  if (suggested.length === 1 && original === '') {
+    return /[.!?'"(),]/.test(suggested) // Only allow adding punctuation
+  }
+  
+  // Don't suggest changes that are too small and unclear
+  if (original.length <= 2 && suggested.length <= 2 && 
+      !original.includes(' ') && !suggested.includes(' ')) {
+    // Only allow if it's a clear spelling correction or meaningful change
+    const lengthDiff = Math.abs(original.length - suggested.length)
+    if (lengthDiff > 1) return false
+    
+    // Allow if it's a common word correction
+    const corrections: { [key: string]: string } = {
+      'im': "I'm", 'dont': "don't", 'cant': "can't", 'wont': "won't",
+      'its': "it's", 'youre': "you're", 'theyre': "they're"
+    }
+    if (corrections[original.toLowerCase()] === suggested) return true
+  }
+  
+  // Don't create suggestions for very small fragments
+  if (original.length < 2 && suggested.length < 2) {
+    return false
+  }
+  
+  // Allow meaningful changes
+  return original !== suggested
+}
+
+function consolidateDifferences(diffs: Array<{start: number, end: number, original: string, suggested: string}>) {
+  if (diffs.length <= 1) return diffs
+  
+  // Sort by position
+  diffs.sort((a, b) => a.start - b.start)
+  
+  const consolidated = []
+  let current = diffs[0]
+  
+  for (let i = 1; i < diffs.length; i++) {
+    const next = diffs[i]
+    
+    // If diffs are very close together (within 2 characters), consider consolidating
+    if (next.start - current.end <= 2) {
+      // Get the text between the two changes
+      // For now, keep them separate to maintain clarity
+      consolidated.push(current)
+      current = next
+    } else {
+      consolidated.push(current)
+      current = next
+    }
+  }
+  
+  consolidated.push(current)
+  return consolidated
+}
+
+function getGrammarifyContextBefore(text: string, position: number, contextLength: number = 20): string {
+  const start = Math.max(0, position - contextLength)
+  return text.substring(start, position).trim()
+}
+
+function getGrammarifyContextAfter(text: string, position: number, contextLength: number = 20): string {
+  const end = Math.min(text.length, position + contextLength)
+  return text.substring(position, end).trim()
+}
+
+// Simple context functions for new text checkers
+function getContextBefore(text: string, position: number, contextLength: number = 20): string {
+  const start = Math.max(0, position - contextLength)
+  return text.substring(start, position).trim()
+}
+
+function getContextAfter(text: string, position: number, contextLength: number = 20): string {
+  const end = Math.min(text.length, position + contextLength)
+  return text.substring(position, end).trim()
+}
+
+function getGrammarifyExplanation(original: string, suggested: string): string {
+  // Provide basic explanations for common grammarify fixes
+  if (original.length > suggested.length) {
+    return "Removed extra spaces or characters"
+  } else if (suggested.length > original.length) {
+    return "Added missing punctuation or capitalization"
+  } else if (original.toLowerCase() !== suggested.toLowerCase()) {
+    return "Fixed capitalization"
+  } else if (original !== suggested) {
+    return "Corrected spelling or grammar"
+  } else {
+    return "General text improvement"
+  }
 }
