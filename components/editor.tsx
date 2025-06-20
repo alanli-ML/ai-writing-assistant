@@ -3,12 +3,13 @@
 import type React from "react"
 
 import { useEffect, useState, useRef } from "react"
-import { Loader2, MessageSquare, Sparkles, X } from "lucide-react"
+import { Loader2, MessageSquare, Sparkles, X, RefreshCw } from "lucide-react"
 import { doc, getDoc } from "firebase/firestore"
 
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { useToast } from "@/components/ui/use-toast"
 import { cn } from "@/lib/utils"
 import { useAuth, db } from "@/components/auth-provider"
@@ -66,6 +67,14 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
     writingGoals: ["clarity", "persuasion", "grammar", "tone", "brevity", "consistency"]
   })
   
+  // Rewrite functionality state
+  const [selectedText, setSelectedText] = useState<string>("")
+  const [selectedTextRange, setSelectedTextRange] = useState<{start: number, end: number} | null>(null)
+  const [rewriteTone, setRewriteTone] = useState<string>(userSettings.preferredTone || "professional")
+  const [rewrittenText, setRewrittenText] = useState<string>("")
+  const [isRewriting, setIsRewriting] = useState(false)
+  const [showRewriteBox, setShowRewriteBox] = useState(false)
+  
   // Analytics tracking refs
   const wordCountRef = useRef(0)
   const suggestionTimestamps = useRef<Record<string, number>>({})
@@ -74,7 +83,14 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
   const autoAnalysisCompleted = useRef<boolean>(false)
   const lastDocumentId = useRef<string | undefined>(undefined)
   
+  // Incremental analysis state - track text sections and their hashes
+  const previousTextSections = useRef<Array<{hash: string, content: string, startIndex: number, endIndex: number}>>([])
+  const sectionSuggestions = useRef<Map<string, Suggestion[]>>(new Map())
+  
   const editorRef = useRef<HTMLDivElement>(null)
+
+  // Debounced immediate analysis to prevent UI lag
+  const debouncedImmediateAnalysis = useRef<NodeJS.Timeout | null>(null)
 
   useEffect(() => {
     setValue(content)
@@ -114,6 +130,13 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
     fetchUserSettings()
   }, [user])
 
+  // Update rewrite tone when user settings change
+  useEffect(() => {
+    if (userSettings.preferredTone) {
+      setRewriteTone(userSettings.preferredTone)
+    }
+  }, [userSettings.preferredTone])
+
   // Auto-analyze existing content when document is opened
   useEffect(() => {
     // Reset auto-analysis flag when document changes
@@ -137,14 +160,14 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
       !autoAnalysisCompleted.current &&
       !analyzing
     ) {
-      console.log(`📄 Document opened with existing content (${documentId || 'no-id'}), auto-analyzing...`)
+      console.log(`📄 Document opened with existing content (${documentId || 'no-id'}), running comprehensive analysis...`)
       
       // Mark this document as being auto-analyzed to prevent loops
       autoAnalysisCompleted.current = true
       
       // Add a small delay to ensure UI is ready
       const timeout = setTimeout(() => {
-        analyzeTextAutomatic(content)
+        analyzeTextManual(content)
       }, 500)
 
       return () => clearTimeout(timeout)
@@ -212,29 +235,39 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
     const editor = editorRef.current
     if (!editor || isTyping) return // Don't interfere while user is typing
 
-    // Save current cursor position
-    const selection = window.getSelection()
-    let cursorOffset = 0
-    
-    if (selection && selection.rangeCount > 0 && editor.contains(selection.anchorNode)) {
-      const range = selection.getRangeAt(0)
-      const preCaretRange = range.cloneRange()
-      preCaretRange.selectNodeContents(editor)
-      preCaretRange.setEnd(range.endContainer, range.endOffset)
-      cursorOffset = preCaretRange.toString().length
-    }
-
-    // Update content to show highlights when not typing
-    const targetHTML = suggestions.length > 0 ? renderHighlightedHTML() : escapeHtml(value)
-    
-    if (editor.innerHTML !== targetHTML) {
-      editor.innerHTML = targetHTML
+    // Add a small delay to ensure user is really done typing
+    const updateTimeout = setTimeout(() => {
+      // Double-check that user is still not typing
+      if (isTyping) return
       
-      // Restore cursor position after content update
-      setTimeout(() => {
-        restoreCursorPosition(cursorOffset)
-      }, 0)
-    }
+      // Save current cursor position
+      const selection = window.getSelection()
+      let cursorOffset = 0
+      
+      if (selection && selection.rangeCount > 0 && editor.contains(selection.anchorNode)) {
+        const range = selection.getRangeAt(0)
+        const preCaretRange = range.cloneRange()
+        preCaretRange.selectNodeContents(editor)
+        preCaretRange.setEnd(range.endContainer, range.endOffset)
+        cursorOffset = preCaretRange.toString().length
+      }
+
+      // Update content to show highlights when not typing
+      const targetHTML = suggestions.length > 0 ? renderHighlightedHTML() : escapeHtml(value)
+      
+      if (editor.innerHTML !== targetHTML) {
+        editor.innerHTML = targetHTML
+        
+        // Restore cursor position after content update
+        setTimeout(() => {
+          if (!isTyping) { // Only restore if still not typing
+            restoreCursorPosition(cursorOffset)
+          }
+        }, 0)
+      }
+    }, 100) // Small delay to debounce updates
+
+    return () => clearTimeout(updateTimeout)
   }, [value, suggestions, isTyping])
 
   const restoreCursorPosition = (targetOffset: number) => {
@@ -577,21 +610,37 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
         setSuggestions([])
       }
 
-      // Set new timeout to analyze text after user stops typing
+      // Check if user just finished typing a word (for immediate Typo.js analysis)
+      const isWordCompletion = checkIfWordCompleted(oldValue, newValue, changeStart)
+      
+      if (isWordCompletion) {
+        // Run immediate Typo.js spell check without waiting
+        console.log("🔤 Word completed, running immediate spell check...")
+        analyzeTypoJsImmediate(newValue)
+      }
+
+      // Set timeout for comprehensive OpenAI analysis after user stops typing
       const timeout = setTimeout(() => {
         setIsTyping(false) // Stop typing mode before analysis
-        analyzeTextAutomatic(newValue)
+        // Clean up invalid suggestions before running new analysis
+        cleanupInvalidSuggestions(newValue)
+        analyzeOpenAIDelayed(newValue)
       }, 2000)
 
     setTypingTimeout(timeout)
-    
-    // Clear typing state after a shorter delay for immediate feedback
-    setTimeout(() => {
-      setIsTyping(false)
-    }, 500) // Balanced delay for typing experience
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // Mark as typing for any key that could modify content
+    const contentModifyingKeys = ['Enter', 'Backspace', 'Delete', 'Tab']
+    const isContentModifying = contentModifyingKeys.includes(e.key) || 
+                              e.key.length === 1 || // Single character keys
+                              (e.ctrlKey && ['v', 'x', 'z', 'y'].includes(e.key.toLowerCase())) // Paste, cut, undo, redo
+    
+    if (isContentModifying) {
+      setIsTyping(true)
+    }
+    
     // Handle special key combinations
     if (e.key === 'Tab') {
       e.preventDefault()
@@ -604,12 +653,7 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
       insertTextAtCursor('\n')
     }
     
-    // Show highlights immediately when user navigates (doesn't change content)
-    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(e.key)) {
-      setIsTyping(false)
-    }
-    
-    // Show highlights when user presses Escape (common UI pattern)
+    // Only show highlights for pure navigation when user explicitly stops (Escape)
     if (e.key === 'Escape') {
       setIsTyping(false)
     }
@@ -704,13 +748,20 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
     return { typo: typoModule }
   }
 
-  // Intelligent suggestion merging - keeps existing valid suggestions and adds new ones
+  // Intelligent suggestion merging with OpenAI priority over Typo.js
   const mergeSuggestionsIntelligently = (
     existingSuggestions: Suggestion[], 
     newSuggestions: Suggestion[], 
     currentText: string
   ): Suggestion[] => {
-    console.log("🔄 Merging suggestions intelligently...")
+    console.log("🔄 Merging suggestions intelligently with OpenAI priority...")
+    
+    // Helper function to determine suggestion source
+    const getSuggestionSource = (suggestion: Suggestion): 'openai' | 'typo' | 'other' => {
+      if (suggestion.id.startsWith('openai-')) return 'openai'
+      if (suggestion.id.startsWith('typo-')) return 'typo'
+      return 'other'
+    }
     
     // 1. Filter out existing suggestions that are no longer valid (text changed)
     const validExistingSuggestions = existingSuggestions.filter(suggestion => {
@@ -727,10 +778,12 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
       return isStillValid
     })
     
-    // 2. Remove overlapping suggestions (newer ones take precedence)
+    // 2. Remove overlapping suggestions with priority: OpenAI > Typo.js > Others
     const mergedSuggestions: Suggestion[] = [...validExistingSuggestions]
     
     newSuggestions.forEach(newSuggestion => {
+      const newSource = getSuggestionSource(newSuggestion)
+      
       // Check if this new suggestion overlaps with any existing ones
       const overlappingIndices: number[] = []
       
@@ -744,58 +797,261 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
         const overlaps = (newStart < existingEnd && newEnd > existingStart)
         
         if (overlaps) {
-          overlappingIndices.push(index)
-          console.log(`🔄 New suggestion "${newSuggestion.original}" overlaps with existing "${existingSuggestion.original}"`)
+          const existingSource = getSuggestionSource(existingSuggestion)
+          
+          // Determine if new suggestion should replace existing one
+          let shouldReplace = false
+          
+          if (newSource === 'openai' && existingSource === 'typo') {
+            // OpenAI suggestions always override Typo.js suggestions
+            shouldReplace = true
+            console.log(`🧠 OpenAI suggestion "${newSuggestion.original}" overrides Typo.js suggestion "${existingSuggestion.original}"`)
+          } else if (newSource === 'openai' && existingSource === 'openai') {
+            // Between OpenAI suggestions, newer takes precedence
+            shouldReplace = true
+            console.log(`🔄 Newer OpenAI suggestion "${newSuggestion.original}" replaces older OpenAI suggestion "${existingSuggestion.original}"`)
+          } else if (newSource === 'typo' && existingSource === 'openai') {
+            // Typo.js suggestions never override OpenAI suggestions
+            shouldReplace = false
+            console.log(`🛡️ Keeping OpenAI suggestion "${existingSuggestion.original}" over Typo.js suggestion "${newSuggestion.original}"`)
+          } else if (newSource === 'typo' && existingSource === 'typo') {
+            // Between Typo.js suggestions, newer takes precedence
+            shouldReplace = true
+            console.log(`🔄 Newer Typo.js suggestion "${newSuggestion.original}" replaces older Typo.js suggestion "${existingSuggestion.original}"`)
+          } else {
+            // Default: newer suggestion takes precedence
+            shouldReplace = true
+            console.log(`🔄 New ${newSource} suggestion "${newSuggestion.original}" replaces ${existingSource} suggestion "${existingSuggestion.original}"`)
+          }
+          
+          if (shouldReplace) {
+            overlappingIndices.push(index)
+          }
         }
       })
       
-      // Remove overlapping existing suggestions (in reverse order to maintain indices)
+      // Remove overlapping existing suggestions that should be replaced (in reverse order to maintain indices)
       overlappingIndices.reverse().forEach(index => {
         const removed = mergedSuggestions.splice(index, 1)[0]
-        console.log(`❌ Removed overlapping suggestion: "${removed.original}"`)
+        console.log(`❌ Removed overlapping suggestion: "${removed.original}" (${getSuggestionSource(removed)})`)
       })
       
-      // Add the new suggestion
-      mergedSuggestions.push(newSuggestion)
-      console.log(`✅ Added new suggestion: "${newSuggestion.original}"`)
+      // Add the new suggestion only if it wasn't blocked by a higher priority existing suggestion
+      if (overlappingIndices.length > 0 || !mergedSuggestions.some(existing => {
+        const newStart = newSuggestion.position.start
+        const newEnd = newSuggestion.position.end
+        const existingStart = existing.position.start
+        const existingEnd = existing.position.end
+        const overlaps = (newStart < existingEnd && newEnd > existingStart)
+        
+        if (overlaps) {
+          const existingSource = getSuggestionSource(existing)
+          // Block if existing OpenAI suggestion would prevent adding Typo.js suggestion
+          return newSource === 'typo' && existingSource === 'openai'
+        }
+        return false
+      })) {
+        mergedSuggestions.push(newSuggestion)
+        console.log(`✅ Added new ${newSource} suggestion: "${newSuggestion.original}"`)
+      } else {
+        console.log(`🚫 Blocked ${newSource} suggestion "${newSuggestion.original}" due to higher priority existing suggestion`)
+      }
     })
     
     // 3. Sort suggestions by position for consistent ordering
     mergedSuggestions.sort((a, b) => a.position.start - b.position.start)
     
-    console.log(`📊 Merge complete: ${validExistingSuggestions.length} valid existing + ${newSuggestions.length} new = ${mergedSuggestions.length} total`)
+    const openaiCount = mergedSuggestions.filter(s => getSuggestionSource(s) === 'openai').length
+    const typoCount = mergedSuggestions.filter(s => getSuggestionSource(s) === 'typo').length
+    const otherCount = mergedSuggestions.filter(s => getSuggestionSource(s) === 'other').length
+    
+    console.log(`📊 Merge complete: ${mergedSuggestions.length} total (${openaiCount} OpenAI, ${typoCount} Typo.js, ${otherCount} other)`)
     
     return mergedSuggestions
   }
 
-    // Fast automatic analysis: immediate Typo.js + background OpenAI
+  // Check if user just completed typing a word
+  const checkIfWordCompleted = (oldText: string, newText: string, changeStart: number): boolean => {
+    // If text got shorter (deletion), not word completion
+    if (newText.length < oldText.length) return false
+    
+    // Check if the last character added is a word boundary
+    const lastChar = newText[newText.length - 1]
+    const wordBoundaryChars = [' ', '\n', '\t', '.', ',', '!', '?', ';', ':', ')', ']', '}']
+    
+    if (wordBoundaryChars.includes(lastChar)) {
+      // Make sure there's actually a word before this boundary
+      const wordBefore = newText.substring(0, newText.length - 1).match(/\w+$/)?.[0]
+      return !!(wordBefore && wordBefore.length >= 2) // At least 2 characters to be a meaningful word
+    }
+    
+    return false
+  }
+
+  // Optimized immediate Typo.js spell checking (debounced and idle-scheduled)
+  const analyzeTypoJsImmediate = async (text: string) => {
+    if (!text || text.length < 5) return
+    
+    // Clear any existing debounced analysis
+    if (debouncedImmediateAnalysis.current) {
+      clearTimeout(debouncedImmediateAnalysis.current)
+    }
+    
+    // Debounce immediate analysis to prevent excessive calls
+    debouncedImmediateAnalysis.current = setTimeout(() => {
+      // Use requestIdleCallback to run during browser idle time
+      const runAnalysis = () => {
+        console.log("⚡ Running optimized immediate Typo.js spell check...")
+        performImmediateSpellCheck(text)
+      }
+      
+      // Use requestIdleCallback if available, otherwise setTimeout
+      if (typeof window !== 'undefined' && window.requestIdleCallback) {
+        window.requestIdleCallback(runAnalysis, { timeout: 100 })
+      } else {
+        setTimeout(runAnalysis, 0)
+      }
+    }, 150) // 150ms debounce to prevent lag during rapid typing
+  }
+
+  // Lightweight spell checking function
+  const performImmediateSpellCheck = async (text: string) => {
+    try {
+      // Don't set analyzing state to avoid cursor interference
+      const newTypoSuggestions: Suggestion[] = []
+      let suggestionIdCounter = Date.now()
+      
+      // Load Typo.js (cached after first load)
+      const { typo: Typo } = await loadTextCheckers()
+      let dictionary: any = null
+      
+      try {
+        const [affData, dicData] = await Promise.all([
+          fetch('/dictionaries/en_US.aff').then(res => res.text()),
+          fetch('/dictionaries/en_US.dic').then(res => res.text())
+        ])
+        dictionary = new Typo("en_US", affData, dicData)
+      } catch (error) {
+        console.log("ℹ️ Typo.js dictionary not available for immediate check")
+        return
+      }
+      
+      if (dictionary) {
+        // Ultra-lightweight: only check the last few words to minimize processing
+        const words = text.split(/\s+/)
+        const lastWords = words.slice(-3) // Only check last 3 words
+        
+        for (const word of lastWords) {
+          const cleanWord = word.replace(/[^\w'-]/g, '') // Remove punctuation but keep apostrophes and hyphens
+          
+          if (cleanWord.length < 2 || isCommonContraction(cleanWord)) continue
+          
+          const isCorrect = dictionary.check(cleanWord)
+          if (!isCorrect) {
+            const suggestions = dictionary.suggest(cleanWord, 2) // Limit to 2 suggestions for speed
+            if (suggestions && suggestions.length > 0) {
+              // Find only the most recent occurrence of this word
+              const wordOccurrences = findWordOccurrences(text, cleanWord)
+              const lastOccurrence = wordOccurrences[wordOccurrences.length - 1]
+              
+              if (lastOccurrence) {
+                const suggestion: Suggestion = {
+                  id: `typo-immediate-${suggestionIdCounter++}`,
+                  type: "grammar",
+                  position: { start: lastOccurrence.start, end: lastOccurrence.end },
+                  original: cleanWord,
+                  suggested: suggestions[0],
+                  contextBefore: getContextBefore(text, lastOccurrence.start),
+                  contextAfter: getContextAfter(text, lastOccurrence.end),
+                  explanation: `Spelling: "${cleanWord}" may be misspelled. Did you mean "${suggestions[0]}"?`,
+                  confidence: 0.8
+                }
+                
+                newTypoSuggestions.push(suggestion)
+              }
+            }
+          }
+        }
+        
+        // Update suggestions without blocking UI
+        if (newTypoSuggestions.length > 0) {
+          // Use requestAnimationFrame to ensure UI updates don't block
+          requestAnimationFrame(() => {
+            setSuggestions(currentSuggestions => {
+              const merged = mergeSuggestionsIntelligently(currentSuggestions, newTypoSuggestions, text)
+              console.log(`⚡ Immediate: Added ${newTypoSuggestions.length} spell check suggestions`)
+              return merged
+            })
+          })
+          
+          // Track suggestions for analytics (non-blocking)
+          if (documentId) {
+            setTimeout(() => {
+              newTypoSuggestions.forEach(suggestion => {
+                suggestionTimestamps.current[suggestion.id] = Date.now()
+                trackSuggestionShown?.(suggestion.id, {
+                  type: suggestion.type,
+                  confidence: suggestion.confidence,
+                  documentId,
+                  textLength: suggestion.original.length,
+                  contextCategory: determineContextCategory(suggestion.position.start, text)
+                }).catch(console.error)
+              })
+            }, 0)
+          }
+        }
+      }
+    } catch (error) {
+      console.log("⚠️ Immediate Typo.js analysis failed:", error)
+    }
+  }
+
+  // Delayed OpenAI analysis (comprehensive analysis after user stops typing)
+  const analyzeOpenAIDelayed = async (text: string) => {
+    console.log("🧠 Running delayed OpenAI analysis via manual analysis...")
+    // Just call the comprehensive manual analysis function
+    await analyzeTextManual(text)
+  }
+
+  // Legacy function - now split into immediate and delayed analysis
   const analyzeTextAutomatic = async (text: string) => {
     if (!text || text.length < 5) {
       setSuggestions([])
       setAnalysisWindow(null)
+      previousTextSections.current = []
+      sectionSuggestions.current.clear()
       return
     }
 
-    console.log("🔍 Running immediate Typo.js analysis + background OpenAI")
+    console.log("🔍 Running incremental analysis (only changed sections)")
     setAnalyzing(true)
     
     try {
-      let suggestionIdCounter = 0
+      // 1. SPLIT TEXT INTO SECTIONS AND DETECT CHANGES
+      const currentSections = splitTextIntoAnalysisSections(text)
+      const changedSections = detectChangedSections(currentSections, previousTextSections.current)
       
-      // 1. IMMEDIATE TYPO.JS SPELL CHECKING
-      const typoSuggestions: Suggestion[] = []
+      console.log(`📊 Analysis: ${currentSections.length} sections total, ${changedSections.length} changed`)
+      
+      if (changedSections.length === 0) {
+        console.log("✅ No changes detected, skipping analysis")
+        setAnalyzing(false)
+        return
+      }
+      
+      let suggestionIdCounter = Date.now() // Use timestamp for unique IDs
+      
+      // 2. IMMEDIATE TYPO.JS SPELL CHECKING (only changed sections)
+      const newTypoSuggestions: Suggestion[] = []
       try {
-        // Load Typo.js library dynamically
         const { typo: Typo } = await loadTextCheckers()
-        
-        // Initialize Typo.js dictionary for spellchecking
         let dictionary: any = null
+        
         try {
           const [affData, dicData] = await Promise.all([
             fetch('/dictionaries/en_US.aff').then(res => res.text()),
             fetch('/dictionaries/en_US.dic').then(res => res.text())
           ])
-          
           dictionary = new Typo("en_US", affData, dicData)
           console.log("✅ Initialized Typo.js dictionary")
         } catch (error) {
@@ -803,60 +1059,73 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
         }
         
         if (dictionary) {
-          const words = text.match(/\b[a-zA-Z]+\b/g) || []
-          const uniqueWords = [...new Set(words)]
-          
-          console.log(`🔤 Spellchecking ${uniqueWords.length} unique words`)
-          
-          uniqueWords.forEach((word) => {
-            if (word.length < 2) return
+          // Process only changed sections
+          for (const section of changedSections) {
+            const words = extractWordsForSpellCheck(section.content)
+            const uniqueWords = [...new Set(words)]
             
-            const isCorrect = dictionary.check(word)
-            if (!isCorrect) {
-              const suggestions = dictionary.suggest(word, 3)
-              if (suggestions && suggestions.length > 0) {
-                let searchIndex = text.indexOf(word)
-                while (searchIndex !== -1) {
-                  const suggestion: Suggestion = {
-                    id: `typo-${suggestionIdCounter++}-${Date.now()}`,
-                    type: "grammar",
-                    position: {
-                      start: searchIndex,
-                      end: searchIndex + word.length
-                    },
-                    original: word,
-                    suggested: suggestions[0],
-                    contextBefore: getContextBefore(text, searchIndex),
-                    contextAfter: getContextAfter(text, searchIndex + word.length),
-                    explanation: `Spelling: "${word}" may be misspelled. Did you mean "${suggestions[0]}"?`,
-                    confidence: 0.8
-                  }
+            uniqueWords.forEach((word: string) => {
+              if (word.length < 2 || isCommonContraction(word)) return
+              
+              const isCorrect = dictionary.check(word)
+              if (!isCorrect) {
+                const suggestions = dictionary.suggest(word, 3)
+                if (suggestions && suggestions.length > 0) {
+                  // Find occurrences within this section only
+                  const wordOccurrences = findWordOccurrences(section.content, word)
                   
-                  typoSuggestions.push(suggestion)
-                  searchIndex = text.indexOf(word, searchIndex + 1)
+                  wordOccurrences.forEach(({ start, end }) => {
+                    // Map section-relative positions to document positions
+                    const docStart = section.startIndex + start
+                    const docEnd = section.startIndex + end
+                    
+                    const suggestion: Suggestion = {
+                      id: `typo-${suggestionIdCounter++}`,
+                      type: "grammar",
+                      position: { start: docStart, end: docEnd },
+                      original: word,
+                      suggested: suggestions[0],
+                      contextBefore: getContextBefore(text, docStart),
+                      contextAfter: getContextAfter(text, docEnd),
+                      explanation: `Spelling: "${word}" may be misspelled. Did you mean "${suggestions[0]}"?`,
+                      confidence: 0.8
+                    }
+                    
+                    newTypoSuggestions.push(suggestion)
+                  })
                 }
               }
-            }
-          })
+            })
+          }
+          
+                     // Store suggestions for changed sections
+           changedSections.forEach(section => {
+             const sectionSuggestionsList = newTypoSuggestions.filter(s => 
+               s.position.start >= section.startIndex && s.position.end <= section.endIndex
+             )
+             sectionSuggestions.current.set(section.hash, sectionSuggestionsList)
+           })
         }
       } catch (error) {
         console.log("⚠️ Typo.js analysis failed:", error)
       }
       
-      // 2. IMMEDIATELY SHOW TYPO.JS SUGGESTIONS
-      if (typoSuggestions.length > 0) {
-        const mergedWithTypo = mergeSuggestionsIntelligently(suggestions, typoSuggestions, text)
-        setSuggestions(mergedWithTypo)
+             // 3. COLLECT ALL VALID SUGGESTIONS (unchanged + new)
+       const allCurrentSuggestions = collectCurrentSuggestions(currentSections, newTypoSuggestions, sectionSuggestions.current)
+      
+      // 4. IMMEDIATELY SHOW UPDATED SUGGESTIONS
+      if (allCurrentSuggestions.length !== suggestions.length || 
+          !allCurrentSuggestions.every(s => suggestions.some(existing => existing.id === s.id))) {
+        setSuggestions(allCurrentSuggestions)
+        console.log(`⚡ Immediate: Updated to ${allCurrentSuggestions.length} suggestions (${newTypoSuggestions.length} new from Typo.js)`)
         
-        console.log(`⚡ Immediate: Added ${typoSuggestions.length} Typo.js suggestions`)
-        
-        // Track immediate suggestions for analytics
-        const newTypoSuggestions = mergedWithTypo.filter((s: Suggestion) => 
+        // Track new suggestions for analytics
+        const actuallyNewSuggestions = allCurrentSuggestions.filter(s => 
           !suggestions.some(existing => existing.id === s.id)
         )
         
-        if (newTypoSuggestions.length > 0 && documentId) {
-          newTypoSuggestions.forEach((suggestion: Suggestion) => {
+        if (actuallyNewSuggestions.length > 0 && documentId) {
+          actuallyNewSuggestions.forEach(suggestion => {
             suggestionTimestamps.current[suggestion.id] = Date.now()
             trackSuggestionShown?.(suggestion.id, {
               type: suggestion.type,
@@ -869,65 +1138,24 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
         }
       }
 
-      // 3. BACKGROUND OPENAI API ANALYSIS
-      console.log("🧠 Starting background OpenAI analysis...")
-      
-      // Don't await this - let it run in background
-      fetch('/api/analyze', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          text: text,
-          preferredTone: userSettings.preferredTone,
-          writingGoals: userSettings.writingGoals
-        }),
-      })
-      .then(async (response) => {
-        if (response.ok) {
-          const data = await response.json()
-          
-          if (data.suggestions && Array.isArray(data.suggestions)) {
-            // Correct OpenAI suggestion positions
-            const correctedOpenAISuggestions = data.suggestions
-              .map((suggestion: Suggestion): Suggestion | null => {
-                const exactPosition = findExactTextPosition(
-                  text,
-                  suggestion.original,
-                  suggestion.position.start,
-                  suggestion.position.end,
-                  suggestion.contextBefore,
-                  suggestion.contextAfter
-                )
-
-                if (exactPosition.found) {
-                  return {
-                    ...suggestion,
-                    id: `openai-${suggestionIdCounter++}-${Date.now()}`,
-                    position: {
-                      start: exactPosition.start,
-                      end: exactPosition.end
-                    }
-                  }
-                } else {
-                  console.log(`❌ Could not locate OpenAI suggestion: "${suggestion.original}"`)
-                  return null
-                }
-              })
-              .filter((s: Suggestion | null): s is Suggestion => s !== null)
-
-            if (correctedOpenAISuggestions.length > 0) {
-              // Merge OpenAI suggestions with current suggestions
+      // 5. BACKGROUND OPENAI API ANALYSIS (only changed sections)
+      if (changedSections.length > 0) {
+        console.log(`🧠 Starting background OpenAI analysis for ${changedSections.length} changed sections...`)
+        
+        // Analyze changed sections in background
+        analyzeChangedSectionsWithOpenAI(changedSections, text, suggestionIdCounter)
+          .then(openAISuggestions => {
+            if (openAISuggestions.length > 0) {
+              // Update suggestions with OpenAI results
               setSuggestions(currentSuggestions => {
-                const merged = mergeSuggestionsIntelligently(currentSuggestions, correctedOpenAISuggestions, text)
-                console.log(`🧠 Background: Added ${correctedOpenAISuggestions.length} OpenAI suggestions`)
+                const merged = mergeSuggestionsIntelligently(currentSuggestions, openAISuggestions, text)
+                console.log(`🧠 Background: Added ${openAISuggestions.length} OpenAI suggestions`)
                 return merged
               })
               
               // Track OpenAI suggestions for analytics
               if (documentId) {
-                correctedOpenAISuggestions.forEach((suggestion: Suggestion) => {
+                openAISuggestions.forEach(suggestion => {
                   suggestionTimestamps.current[suggestion.id] = Date.now()
                   trackSuggestionShown?.(suggestion.id, {
                     type: suggestion.type,
@@ -939,24 +1167,24 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
                 })
               }
             }
-          }
-        } else {
-          console.log("⚠️ OpenAI API request failed:", response.status)
-        }
-      })
-      .catch((error) => {
-        console.log("⚠️ Background OpenAI analysis failed:", error)
-      })
-      .finally(() => {
-        // Stop analyzing spinner when OpenAI analysis is complete (success or failure)
+          })
+          .catch(error => {
+            console.log("⚠️ Background OpenAI analysis failed:", error)
+          })
+          .finally(() => {
+            setAnalyzing(false)
+            console.log("🔄 Incremental analysis complete")
+          })
+      } else {
         setAnalyzing(false)
-        console.log("🔄 Analysis complete - spinner stopped")
-      })
+      }
+      
+      // 6. UPDATE TRACKING STATE
+      previousTextSections.current = currentSections
 
     } catch (error) {
-      console.error("Error with automatic analysis:", error)
-      // Don't show error toast for automatic analysis to avoid interrupting user
-      setAnalyzing(false) // Stop spinner on immediate error
+      console.error("Error with incremental analysis:", error)
+      setAnalyzing(false)
     }
   }
 
@@ -1356,8 +1584,8 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
             return suggestion // Position is already correct
           }
         } else {
-          console.log(`❌ Suggestion "${suggestion.original}" could not be relocated after text change`)
-          return null // Mark for removal
+          console.log(`❌ Removing suggestion "${suggestion.original}" - could not be found in updated text`)
+          return null // Mark for removal - no match found
         }
       })
       .filter((s): s is Suggestion => s !== null) // Remove suggestions that couldn't be relocated
@@ -1405,6 +1633,52 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
           setSelectedSuggestion(updatedSelectedSuggestion)
         }
       }
+    }
+  }
+
+  // Clean up suggestions that can no longer be found in the current text
+  const cleanupInvalidSuggestions = (currentText: string) => {
+    if (suggestions.length === 0) return
+
+    console.log("🧹 Cleaning up invalid suggestions...")
+    
+    const validSuggestions = suggestions.filter((suggestion) => {
+      const exactPosition = findExactTextPosition(
+        currentText,
+        suggestion.original,
+        suggestion.position.start,
+        suggestion.position.end,
+        suggestion.contextBefore,
+        suggestion.contextAfter
+      )
+      
+      if (!exactPosition.found) {
+        console.log(`❌ Removing invalid suggestion: "${suggestion.original}" (ID: ${suggestion.id})`)
+        return false
+      }
+      
+      // Also verify the text at the position matches
+      const textAtPosition = currentText.substring(exactPosition.start, exactPosition.end)
+      if (textAtPosition !== suggestion.original) {
+        console.log(`❌ Removing mismatched suggestion: expected "${suggestion.original}", found "${textAtPosition}" (ID: ${suggestion.id})`)
+        return false
+      }
+      
+      return true
+    })
+
+    const removedCount = suggestions.length - validSuggestions.length
+    if (removedCount > 0) {
+      console.log(`🧹 Cleanup complete: removed ${removedCount} invalid suggestions`)
+      setSuggestions(validSuggestions)
+      
+      // Clear selected suggestion if it was removed
+      if (selectedSuggestion && !validSuggestions.some(s => s.id === selectedSuggestion.id)) {
+        console.log("❌ Selected suggestion was removed during cleanup")
+        setSelectedSuggestion(null)
+      }
+    } else {
+      console.log("✅ All suggestions are valid")
     }
   }
 
@@ -1633,6 +1907,211 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
     }
   }
 
+  // Get the currently selected text or the current sentence
+  const getTextToRewrite = (): { text: string; range: { start: number; end: number } } => {
+    const editor = editorRef.current
+    if (!editor) {
+      return { text: "", range: { start: 0, end: 0 } }
+    }
+
+    const selection = window.getSelection()
+    if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+      // User has selected text
+      const range = selection.getRangeAt(0)
+      const selectedText = selection.toString().trim()
+      
+      if (selectedText.length > 0) {
+        // Calculate the start and end positions in the full text
+        const preCaretRange = range.cloneRange()
+        preCaretRange.selectNodeContents(editor)
+        preCaretRange.setEnd(range.startContainer, range.startOffset)
+        const startPos = preCaretRange.toString().length
+        const endPos = startPos + selectedText.length
+        
+        return {
+          text: selectedText,
+          range: { start: startPos, end: endPos }
+        }
+      }
+    }
+
+    // No selection - get the current sentence
+    const currentSentence = getCurrentSentence()
+    return currentSentence
+  }
+
+  // Get the sentence at the current cursor position
+  const getCurrentSentence = (): { text: string; range: { start: number; end: number } } => {
+    const text = value
+    const cursorPos = cursorPosition
+    
+    if (!text || text.length === 0) {
+      return { text: "", range: { start: 0, end: 0 } }
+    }
+
+    // Find sentence boundaries around cursor position
+    const sentenceEnders = /[.!?]+/g
+    const sentences: Array<{ start: number; end: number; text: string }> = []
+    
+    let lastIndex = 0
+    let match
+    
+    // Find all sentences
+    while ((match = sentenceEnders.exec(text)) !== null) {
+      const endIndex = match.index + match[0].length
+      const sentenceText = text.substring(lastIndex, endIndex).trim()
+      
+      if (sentenceText.length > 0) {
+        sentences.push({
+          start: lastIndex,
+          end: endIndex,
+          text: sentenceText
+        })
+      }
+      lastIndex = endIndex
+    }
+    
+    // Add remaining text as the last sentence if it exists
+    const remaining = text.substring(lastIndex).trim()
+    if (remaining.length > 0) {
+      sentences.push({
+        start: lastIndex,
+        end: text.length,
+        text: remaining
+      })
+    }
+
+    // Find which sentence contains the cursor
+    for (const sentence of sentences) {
+      if (cursorPos >= sentence.start && cursorPos <= sentence.end) {
+        return {
+          text: sentence.text,
+          range: { start: sentence.start, end: sentence.end }
+        }
+      }
+    }
+
+    // Fallback - return the whole text if no sentence found
+    if (sentences.length > 0) {
+      return {
+        text: sentences[sentences.length - 1].text,
+        range: { start: sentences[sentences.length - 1].start, end: sentences[sentences.length - 1].end }
+      }
+    }
+
+    return { text: text, range: { start: 0, end: text.length } }
+  }
+
+  // Handle the rewrite button click
+  const handleRewriteClick = () => {
+    const textToRewrite = getTextToRewrite()
+    
+    if (textToRewrite.text.trim().length === 0) {
+      toast({
+        variant: "destructive",
+        title: "No text to rewrite",
+        description: "Please select some text or place your cursor in a sentence to rewrite.",
+      })
+      return
+    }
+
+    setSelectedText(textToRewrite.text)
+    setSelectedTextRange(textToRewrite.range)
+    setRewrittenText("")
+    setShowRewriteBox(true)
+  }
+
+  // Call the rewrite API
+  const handleRewriteWithAI = async () => {
+    if (!selectedText.trim()) {
+      toast({
+        variant: "destructive",
+        title: "No text selected",
+        description: "Please select text to rewrite first.",
+      })
+      return
+    }
+
+    setIsRewriting(true)
+    
+    try {
+      const response = await fetch('/api/rewrite', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: selectedText,
+          tone: rewriteTone
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
+      }
+
+      const data = await response.json()
+      
+      if (data.error) {
+        throw new Error(data.error)
+      }
+
+      setRewrittenText(data.rewrittenText || "")
+      
+      toast({
+        title: "Text rewritten",
+        description: "Your text has been rewritten with AI. Review and apply if you like the changes.",
+      })
+    } catch (error) {
+      console.error("Error rewriting text:", error)
+      toast({
+        variant: "destructive",
+        title: "Rewrite failed",
+        description: "Failed to rewrite your text. Please try again.",
+      })
+    } finally {
+      setIsRewriting(false)
+    }
+  }
+
+  // Replace the original text with the rewritten text
+  const handleReplaceText = () => {
+    if (!selectedTextRange || !rewrittenText.trim()) {
+      toast({
+        variant: "destructive",
+        title: "Cannot replace text", 
+        description: "No rewritten text available to replace with.",
+      })
+      return
+    }
+
+    const newText = 
+      value.substring(0, selectedTextRange.start) + 
+      rewrittenText + 
+      value.substring(selectedTextRange.end)
+
+    setValue(newText)
+    onChange(newText)
+    setPreviousText(newText)
+
+    // Update suggestion positions after text replacement
+    if (suggestions.length > 0) {
+      const lengthDifference = rewrittenText.length - selectedText.length
+      updateSuggestionPositions(value, newText, selectedTextRange.start)
+    }
+
+    // Close the rewrite box
+    setShowRewriteBox(false)
+    setSelectedText("")
+    setSelectedTextRange(null)
+    setRewrittenText("")
+
+    toast({
+      title: "Text replaced",
+      description: "Your original text has been replaced with the AI-rewritten version.",
+    })
+  }
+
   return (
     <div className="flex flex-col gap-6 md:flex-row">
       <div className="flex-1">
@@ -1645,10 +2124,20 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
             onInput={handleContentEditable}
             onKeyDown={handleKeyDown}
             onFocus={() => {
-              // Don't immediately clear typing state on focus
+              // Clear typing state when editor gains focus (user clicked in)
+              setIsTyping(false)
             }}
             onBlur={() => {
-              setIsTyping(false) // Always clear typing state when editor loses focus
+              // Clear typing state and any pending timeouts when editor loses focus
+              setIsTyping(false)
+              if (typingTimeout) {
+                clearTimeout(typingTimeout)
+                setTypingTimeout(null)
+              }
+            }}
+            onMouseDown={() => {
+              // User clicked in editor - clear typing state to allow immediate highlighting
+              setIsTyping(false)
             }}
             className={cn(
               "min-h-[500px] resize-none p-4 text-base leading-relaxed focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 bg-background",
@@ -1675,23 +2164,136 @@ export function Editor({ content, onChange, documentId }: EditorProps) {
             </div>
           )}
           
-          {suggestions.length > 0 && (
-            <div className="absolute bottom-4 left-4 flex items-center gap-2 rounded-md bg-gradient-to-r from-blue-100 via-purple-100 to-amber-100 dark:from-blue-900/30 dark:via-purple-900/30 dark:to-amber-900/30 px-3 py-1 text-sm text-gray-700 dark:text-gray-300 z-20">
-              <Sparkles className="h-3 w-3" />
-              {suggestions.length} suggestion{suggestions.length > 1 ? 's' : ''} highlighted
-              {selectedSuggestion && (
-                <span className="ml-1 text-xs opacity-75">
-                  ({selectedSuggestion.type} selected)
-                </span>
-              )}
-            </div>
-          )}
-          
-
         </div>
+        
+        {/* Suggestions counter moved outside editor to prevent text overlap */}
+        {suggestions.length > 0 && (
+          <div className="mt-2 flex items-center gap-2 rounded-md bg-gradient-to-r from-blue-100 via-purple-100 to-amber-100 dark:from-blue-900/30 dark:via-purple-900/30 dark:to-amber-900/30 px-3 py-1 text-sm text-gray-700 dark:text-gray-300 w-fit">
+            <Sparkles className="h-3 w-3" />
+            {suggestions.length} suggestion{suggestions.length > 1 ? 's' : ''} highlighted
+            {selectedSuggestion && (
+              <span className="ml-1 text-xs opacity-75">
+                ({selectedSuggestion.type} selected)
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
-      <div className="w-full md:w-80">
+      <div className="w-full md:w-80 space-y-4">
+        {/* AI Rewrite Section */}
+        <div className="rounded-md border">
+          <div className="flex items-center justify-between border-b p-3">
+            <h3 className="flex items-center gap-2 font-medium">
+              <RefreshCw className="h-4 w-4 text-primary" />
+              AI Rewrite
+            </h3>
+          </div>
+          
+          <div className="p-3 space-y-3">
+            <div className="flex items-center gap-2">
+              <Select value={rewriteTone} onValueChange={setRewriteTone}>
+                <SelectTrigger className="flex-1">
+                  <SelectValue placeholder="Select tone" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="professional">Professional</SelectItem>
+                  <SelectItem value="casual">Casual</SelectItem>
+                  <SelectItem value="persuasive">Persuasive</SelectItem>
+                  <SelectItem value="academic">Academic</SelectItem>
+                  <SelectItem value="creative">Creative</SelectItem>
+                  <SelectItem value="concise">Concise</SelectItem>
+                  <SelectItem value="empathetic">Empathetic</SelectItem>
+                  <SelectItem value="confident">Confident</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button 
+                onClick={handleRewriteClick}
+                size="sm"
+                disabled={!value.trim()}
+              >
+                <RefreshCw className="h-3 w-3 mr-1" />
+                Select Text
+              </Button>
+            </div>
+            
+            {showRewriteBox && (
+              <div className="space-y-3 border-t pt-3">
+                {/* Original Text */}
+                <div>
+                  <label className="text-xs text-muted-foreground mb-1 block">
+                    Original Text:
+                  </label>
+                  <Textarea
+                    value={selectedText}
+                    readOnly
+                    className="text-sm bg-muted/50 resize-none"
+                    rows={3}
+                  />
+                </div>
+                
+                {/* Rewrite Button */}
+                <Button 
+                  onClick={handleRewriteWithAI}
+                  disabled={isRewriting || !selectedText.trim()}
+                  className="w-full"
+                  size="sm"
+                >
+                  {isRewriting ? (
+                    <>
+                      <Loader2 className="h-3 w-3 mr-2 animate-spin" />
+                      Rewriting...
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-3 w-3 mr-2" />
+                      Rewrite with AI
+                    </>
+                  )}
+                </Button>
+                
+                {/* Rewritten Text */}
+                {rewrittenText && (
+                  <div>
+                    <label className="text-xs text-muted-foreground mb-1 block">
+                      Rewritten Text:
+                    </label>
+                    <Textarea
+                      value={rewrittenText}
+                      onChange={(e) => setRewrittenText(e.target.value)}
+                      className="text-sm resize-none"
+                      rows={4}
+                      placeholder="AI rewritten text will appear here..."
+                    />
+                    <div className="flex gap-2 mt-2">
+                      <Button 
+                        onClick={handleReplaceText}
+                        size="sm"
+                        className="flex-1"
+                      >
+                        Replace Original
+                      </Button>
+                      <Button 
+                        onClick={() => {
+                          setShowRewriteBox(false)
+                          setSelectedText("")
+                          setSelectedTextRange(null)
+                          setRewrittenText("")
+                        }}
+                        variant="outline"
+                        size="sm"
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Suggestions Section */}
         <div className="rounded-md border">
           <div className="flex items-center justify-between border-b p-3">
             <h3 className="flex items-center gap-2 font-medium">
@@ -2143,5 +2745,288 @@ function getGrammarifyExplanation(original: string, suggested: string): string {
     return "Corrected spelling or grammar"
   } else {
     return "General text improvement"
+  }
+}
+
+// Improved word extraction for spell checking that handles contractions and hyphenated words
+function extractWordsForSpellCheck(text: string): string[] {
+  // Pattern that captures:
+  // - Regular words: \b[a-zA-Z]+\b
+  // - Contractions: \b[a-zA-Z]+(?:'[a-zA-Z]+)+\b (don't, won't, I'm, etc.)
+  // - Hyphenated words: \b[a-zA-Z]+(?:-[a-zA-Z]+)+\b (well-known, twenty-one, etc.)
+  // - Mixed: \b[a-zA-Z]+(?:[-'][a-zA-Z]+)*\b (handles both cases)
+  const wordPattern = /\b[a-zA-Z]+(?:[-'][a-zA-Z]+)*\b/g
+  const matches = text.match(wordPattern) || []
+  
+  const words: string[] = []
+  
+  matches.forEach(match => {
+    // For contractions, we want to check the individual parts
+    if (match.includes("'")) {
+      // Handle contractions by splitting and checking each part
+      const parts = match.split("'")
+      if (parts.length === 2) {
+        const [mainPart, contractionPart] = parts
+        
+        // Add the main part (e.g., "don" from "don't")
+        if (mainPart.length >= 2) {
+          words.push(mainPart)
+        }
+        
+        // For common contraction endings, don't spell-check them
+        // But for possessives or less common contractions, check the second part
+        if (contractionPart.length >= 2 && 
+            !['t', 're', 've', 'll', 'd', 's', 'm'].includes(contractionPart.toLowerCase())) {
+          words.push(contractionPart)
+        }
+      }
+    } else if (match.includes('-')) {
+      // For hyphenated words, check each part separately
+      const parts = match.split('-')
+      parts.forEach(part => {
+        if (part.length >= 2) {
+          words.push(part)
+        }
+      })
+    } else {
+      // Regular word
+      words.push(match)
+    }
+  })
+  
+  return words
+}
+
+// Check if a word is a common contraction part that shouldn't be spell-checked
+function isCommonContraction(word: string): boolean {
+  const commonContractions = new Set([
+    // Common contraction endings
+    't', 're', 've', 'll', 'd', 's', 'm',
+    // Full contractions
+    "don't", "won't", "can't", "shouldn't", "wouldn't", "couldn't", "didn't",
+    "haven't", "hasn't", "hadn't", "isn't", "aren't", "wasn't", "weren't",
+    "i'm", "you're", "he's", "she's", "it's", "we're", "they're",
+    "i've", "you've", "we've", "they've", "i'll", "you'll", "he'll", 
+    "she'll", "it'll", "we'll", "they'll", "i'd", "you'd", "he'd",
+    "she'd", "we'd", "they'd"
+  ])
+  
+  return commonContractions.has(word.toLowerCase())
+}
+
+// Find all occurrences of a word with proper word boundaries
+function findWordOccurrences(text: string, word: string): Array<{start: number, end: number}> {
+  const occurrences: Array<{start: number, end: number}> = []
+  
+  // Create a regex that matches the word with word boundaries
+  // Escape special regex characters in the word
+  const escapedWord = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const wordRegex = new RegExp(`\\b${escapedWord}\\b`, 'gi')
+  
+  let match
+  while ((match = wordRegex.exec(text)) !== null) {
+    occurrences.push({
+      start: match.index,
+      end: match.index + match[0].length
+    })
+  }
+  
+  return occurrences
+}
+
+// Split text into sections for incremental analysis
+function splitTextIntoAnalysisSections(text: string): Array<{hash: string, content: string, startIndex: number, endIndex: number}> {
+  const sections: Array<{hash: string, content: string, startIndex: number, endIndex: number}> = []
+  
+  // Split by paragraphs (double newlines) and sentences within paragraphs
+  const paragraphs = text.split(/\n\s*\n/)
+  let currentIndex = 0
+  
+  for (const paragraph of paragraphs) {
+    if (paragraph.trim().length === 0) {
+      currentIndex += paragraph.length + 2 // Account for the double newline
+      continue
+    }
+    
+    // Find the actual start position of this paragraph in the original text
+    const paragraphStart = text.indexOf(paragraph, currentIndex)
+    
+    // For shorter paragraphs, treat the whole paragraph as one section
+    if (paragraph.length < 200) {
+      const hash = simpleHash(paragraph.trim())
+      sections.push({
+        hash,
+        content: paragraph,
+        startIndex: paragraphStart,
+        endIndex: paragraphStart + paragraph.length
+      })
+    } else {
+      // For longer paragraphs, split into sentences
+      const sentences = splitIntoSentences(paragraph)
+      let sentenceStartInParagraph = 0
+      
+      for (const sentence of sentences) {
+        if (sentence.trim().length < 10) {
+          sentenceStartInParagraph += sentence.length
+          continue
+        }
+        
+        const sentenceStart = paragraph.indexOf(sentence, sentenceStartInParagraph)
+        const actualStart = paragraphStart + sentenceStart
+        const actualEnd = actualStart + sentence.length
+        
+        const hash = simpleHash(sentence.trim())
+        sections.push({
+          hash,
+          content: sentence,
+          startIndex: actualStart,
+          endIndex: actualEnd
+        })
+        
+        sentenceStartInParagraph = sentenceStart + sentence.length
+      }
+    }
+    
+    currentIndex = paragraphStart + paragraph.length + 2
+  }
+  
+  // If no sections were created, use the whole text as one section
+  if (sections.length === 0) {
+    const hash = simpleHash(text.trim())
+    sections.push({
+      hash,
+      content: text,
+      startIndex: 0,
+      endIndex: text.length
+    })
+  }
+  
+  return sections
+}
+
+// Simple hash function for text content
+function simpleHash(text: string): string {
+  let hash = 0
+  if (text.length === 0) return hash.toString()
+  
+  for (let i = 0; i < text.length; i++) {
+    const char = text.charCodeAt(i)
+    hash = ((hash << 5) - hash) + char
+    hash = hash & hash // Convert to 32-bit integer
+  }
+  
+  return Math.abs(hash).toString(36)
+}
+
+// Detect which sections have changed since last analysis
+function detectChangedSections(
+  currentSections: Array<{hash: string, content: string, startIndex: number, endIndex: number}>,
+  previousSections: Array<{hash: string, content: string, startIndex: number, endIndex: number}>
+): Array<{hash: string, content: string, startIndex: number, endIndex: number}> {
+  
+  // Create a set of previous hashes for quick lookup
+  const previousHashes = new Set(previousSections.map(s => s.hash))
+  
+  // Return sections that don't exist in previous analysis
+  return currentSections.filter(section => !previousHashes.has(section.hash))
+}
+
+// Collect all valid suggestions from unchanged sections plus new suggestions
+function collectCurrentSuggestions(
+  currentSections: Array<{hash: string, content: string, startIndex: number, endIndex: number}>,
+  newSuggestions: Suggestion[],
+  sectionSuggestionsMap: Map<string, Suggestion[]>
+): Suggestion[] {
+  const allSuggestions: Suggestion[] = []
+  
+  // Add suggestions from unchanged sections
+  currentSections.forEach(section => {
+    const sectionSuggestionsList = sectionSuggestionsMap.get(section.hash)
+    if (sectionSuggestionsList) {
+      allSuggestions.push(...sectionSuggestionsList)
+    }
+  })
+  
+  // Add new suggestions
+  allSuggestions.push(...newSuggestions)
+  
+  // Remove duplicates and sort by position
+  const uniqueSuggestions = allSuggestions.filter((suggestion, index, self) => 
+    index === self.findIndex(s => s.id === suggestion.id)
+  )
+  
+  return uniqueSuggestions.sort((a, b) => a.position.start - b.position.start)
+}
+
+// Analyze changed sections with OpenAI in background
+async function analyzeChangedSectionsWithOpenAI(
+  changedSections: Array<{hash: string, content: string, startIndex: number, endIndex: number}>,
+  fullText: string,
+  suggestionIdCounter: number
+): Promise<Suggestion[]> {
+  
+  // Combine changed sections into a single text for analysis if they're small
+  // Or analyze larger sections individually
+  const combinedText = changedSections.map(s => s.content).join('\n\n')
+  
+  try {
+    const response = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text: combinedText,
+        preferredTone: "professional", // Will be updated with actual user settings
+        writingGoals: ["clarity", "grammar", "tone"]
+      }),
+    })
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`)
+    }
+
+    const data = await response.json()
+    
+    if (!data.suggestions || !Array.isArray(data.suggestions)) {
+      return []
+    }
+
+    // Map suggestions back to full document coordinates
+    const mappedSuggestions: Suggestion[] = []
+    let combinedTextOffset = 0
+    
+    for (const section of changedSections) {
+      const sectionSuggestions = data.suggestions.filter((suggestion: any) => {
+        const suggestionStart = suggestion.position.start
+        const suggestionEnd = suggestion.position.end
+        return suggestionStart >= combinedTextOffset && 
+               suggestionEnd <= combinedTextOffset + section.content.length
+      })
+      
+      sectionSuggestions.forEach((suggestion: any) => {
+        // Adjust position to full document coordinates
+        const docStart = section.startIndex + (suggestion.position.start - combinedTextOffset)
+        const docEnd = section.startIndex + (suggestion.position.end - combinedTextOffset)
+        
+        // Verify the position is valid
+        const originalText = fullText.substring(docStart, docEnd)
+        if (originalText === suggestion.original) {
+          mappedSuggestions.push({
+            ...suggestion,
+            id: `openai-${suggestionIdCounter++}`,
+            position: { start: docStart, end: docEnd }
+          })
+        }
+      })
+      
+      combinedTextOffset += section.content.length + 2 // +2 for '\n\n' separator
+    }
+    
+    return mappedSuggestions
+    
+  } catch (error) {
+    console.error("Error in OpenAI analysis for changed sections:", error)
+    return []
   }
 }
